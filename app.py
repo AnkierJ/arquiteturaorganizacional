@@ -1,5 +1,6 @@
 ﻿import tempfile
 import json
+import base64
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -24,15 +25,45 @@ st.markdown(
     }
     .brand-title {
         color: #14315E;
-        font-size: 2rem;
+        font-size: 8.4rem;
         font-weight: 700;
-        margin: 0;
+        margin: 0.35rem 0 0 0;
+        text-align: center;
     }
     .brand-subtitle {
         color: #14315E;
         opacity: 0.85;
-        margin-top: 0.25rem;
+        margin-top: 0.35rem;
         margin-bottom: 0;
+        text-align: center;
+    }
+    .brand-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 0.15rem 0 0.5rem 0;
+    }
+    .brand-header-left,
+    .brand-header-right {
+        width: 220px;
+        min-width: 180px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .brand-header-center {
+        flex: 1;
+        text-align: center;
+    }
+    .brand-title-block {
+        padding-bottom: 0.4rem;
+    }
+    .brand-logo {
+        max-height: 110px;
+        max-width: 100%;
+        object-fit: contain;
+        display: block;
     }
     section[data-testid="stSidebar"] {
         border-right: 1px solid rgba(20, 49, 94, 0.15);
@@ -53,24 +84,41 @@ st.markdown(
 )
 
 
+def logo_data_uri(path: Path, mime: str) -> str | None:
+    if not path.exists():
+        return None
+    raw = path.read_bytes()
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
 def render_brand_header() -> None:
-    left, right1, right2 = st.columns([7, 1.5, 1.5])
-    with left:
-        st.markdown('<p class="brand-title">Organograma da Empresa</p>', unsafe_allow_html=True)
-        st.markdown(
-            '<p class="brand-subtitle">Visualizacao baseada no arquivo organograma.csv</p>',
-            unsafe_allow_html=True,
-        )
+    gentil_uri = logo_data_uri(Path("assets/logoGentil.png"), "image/png")
+    nex_uri = logo_data_uri(Path("assets/logoNEX.svg"), "image/svg+xml")
 
-    logo_gentil = Path("assets/logoGentil.png")
-    logo_nex = Path("assets/logoNEX.svg")
+    gentil_html = (
+        f'<img src="{gentil_uri}" class="brand-logo" alt="Logo Gentil">' if gentil_uri else ""
+    )
+    nex_html = f'<img src="{nex_uri}" class="brand-logo" alt="Logo NEX">' if nex_uri else ""
 
-    with right1:
-        if logo_gentil.exists():
-            st.image(str(logo_gentil), use_container_width=True)
-    with right2:
-        if logo_nex.exists():
-            st.image(str(logo_nex), use_container_width=True)
+    st.markdown(
+        f"""
+        <div class="brand-header">
+            <div class="brand-header-left">{gentil_html}</div>
+            <div class="brand-header-center"></div>
+            <div class="brand-header-right">{nex_html}</div>
+        </div>
+        <div class="brand-title-block" style="text-align:center; padding-bottom:0.4rem;">
+            <h1 style="margin:0.35rem 0 0 0; color:#14315E; font-size:6rem !important; line-height:1.05; font-weight:800;">
+                Organograma da Empresa
+            </h1>
+            <p style="margin:0.4rem 0 0 0; color:#14315E; opacity:0.85; font-size:1.25rem; font-weight:600;">
+                Visualizacao baseada no arquivo organograma.csv
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 @st.cache_data
