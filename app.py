@@ -80,6 +80,52 @@ st.markdown(
         padding: 0.35rem 0.5rem;
         background: linear-gradient(180deg, rgba(47,214,139,0.08), rgba(20,49,94,0.03));
     }
+    .detail-card {
+        border: 1px solid rgba(20, 49, 94, 0.14);
+        border-radius: 14px;
+        padding: 0.9rem 1rem;
+        background: linear-gradient(180deg, rgba(47,214,139,0.08), rgba(20,49,94,0.02));
+        margin: 0.4rem 0 0.8rem 0;
+    }
+    .detail-card-title {
+        color: #14315E;
+        font-size: 1.08rem;
+        font-weight: 800;
+        margin: 0 0 0.25rem 0;
+        line-height: 1.2;
+    }
+    .detail-card-subtitle {
+        color: #2b3f66;
+        font-size: 0.92rem;
+        margin: 0 0 0.7rem 0;
+        line-height: 1.35;
+    }
+    .detail-card-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.45rem 0.75rem;
+    }
+    .detail-card-field {
+        background: rgba(255,255,255,0.72);
+        border: 1px solid rgba(20, 49, 94, 0.08);
+        border-radius: 10px;
+        padding: 0.45rem 0.6rem;
+    }
+    .detail-card-label {
+        color: #6b7a95;
+        font-size: 0.72rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin: 0;
+    }
+    .detail-card-value {
+        color: #14315E;
+        font-size: 0.92rem;
+        font-weight: 700;
+        margin: 0.1rem 0 0 0;
+        line-height: 1.25;
+    }
     div[data-testid="stToggle"] label p {
         font-size: 0.85rem;
         color: #14315E;
@@ -475,6 +521,16 @@ def build_focus_scope(work: pd.DataFrame, focus_ids: list[str], up_levels: int =
                 q_down.append((child, depth + 1))
 
     return selected
+
+
+def get_person_label(df: pd.DataFrame, mat: str) -> str:
+    if not mat:
+        return ""
+    person = df[df["MAT"] == mat]
+    if person.empty:
+        return mat
+    nome = str(person.iloc[0]["NOME"]).strip()
+    return nome or mat
 
 
 def build_pyvis_network(work: pd.DataFrame, direction: str = "UD", highlighted_ids: set[str] | None = None) -> Network:
@@ -953,13 +1009,28 @@ def main():
 
         selected_suggestion = suggestions[selected_idx]
         st.subheader("Sugestao de reorganizacao")
-        st.write(
-            {
-                "Titulo": selected_suggestion.get("title", ""),
-                "Resumo": selected_suggestion.get("summary", ""),
-                "Tipo": selected_suggestion.get("kind", ""),
-                "Impacto": int(selected_suggestion.get("impact", 0)),
-            }
+        suggestion_title = html.escape(str(selected_suggestion.get("title", "")))
+        suggestion_summary = html.escape(str(selected_suggestion.get("summary", "")))
+        suggestion_kind = html.escape(str(selected_suggestion.get("kind", ""))).title()
+        suggestion_impact = int(selected_suggestion.get("impact", 0))
+        st.markdown(
+            f"""
+            <div class="detail-card">
+                <p class="detail-card-title">{suggestion_title}</p>
+                <p class="detail-card-subtitle">{suggestion_summary}</p>
+                <div class="detail-card-grid">
+                    <div class="detail-card-field">
+                        <p class="detail-card-label">Tipo</p>
+                        <p class="detail-card-value">{suggestion_kind}</p>
+                    </div>
+                    <div class="detail-card-field">
+                        <p class="detail-card-label">Impacto estimado</p>
+                        <p class="detail-card-value">{suggestion_impact}</p>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
         current_focus_ids = build_focus_scope(filtered, list(selected_suggestion.get("focus_ids", [])))
@@ -1001,14 +1072,33 @@ def main():
     person = df[df["MAT"] == selected_node]
     if not person.empty:
         row = person.iloc[0]
-        st.write(
-            {
-                "MAT": row["MAT"],
-                "NOME": row["NOME"],
-                "CARGO": row["CARGO"],
-                "LIDER": row["LIDER"],
-                "POSICAO": row["POSICAO"],
-            }
+        leader_label = html.escape(get_person_label(df, str(row["LIDER"])))
+        st.markdown(
+            f"""
+            <div class="detail-card">
+                <p class="detail-card-title">{html.escape(str(row["NOME"]))}</p>
+                <p class="detail-card-subtitle">{html.escape(str(row["CARGO"]))}</p>
+                <div class="detail-card-grid">
+                    <div class="detail-card-field">
+                        <p class="detail-card-label">MAT</p>
+                        <p class="detail-card-value">{html.escape(str(row["MAT"]))}</p>
+                    </div>
+                    <div class="detail-card-field">
+                        <p class="detail-card-label">Lider</p>
+                        <p class="detail-card-value">{leader_label}</p>
+                    </div>
+                    <div class="detail-card-field">
+                        <p class="detail-card-label">Posicao</p>
+                        <p class="detail-card-value">{html.escape(str(row["POSICAO"]))}</p>
+                    </div>
+                    <div class="detail-card-field">
+                        <p class="detail-card-label">Cargo</p>
+                        <p class="detail-card-value">{html.escape(str(row["CARGO"]))}</p>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
     st.subheader("Tabela")
