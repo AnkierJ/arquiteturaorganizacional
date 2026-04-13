@@ -1,12 +1,15 @@
 ﻿import tempfile
 import json
 import base64
+import html
+import statistics
 from collections import defaultdict, deque
 from pathlib import Path
 
 import networkx as nx
 import pandas as pd
 import streamlit as st
+from PIL import Image
 from pyvis.network import Network
 
 
@@ -15,7 +18,10 @@ BRAND_GREEN = "#2FD68B"
 BRAND_WHITE = "#FFFFFF"
 
 
-st.set_page_config(page_title="Organograma Interativo", layout="wide")
+ICON_PATH = Path("assets/logoOrganograma.png")
+PAGE_ICON = Image.open(ICON_PATH) if ICON_PATH.exists() else None
+
+st.set_page_config(page_title="Organograma Interativo", page_icon=PAGE_ICON, layout="wide")
 
 st.markdown(
     """
@@ -153,6 +159,89 @@ def load_setores(path: str) -> pd.DataFrame:
     return df[(df["SETOR"] != "") & (df["LIDERMAT"] != "")].drop_duplicates().reset_index(drop=True)
 
 
+def get_sector_scope_ids(
+    df: pd.DataFrame,
+    setores_df: pd.DataFrame,
+    selected_setores: list[str],
+) -> set[str]:
+    if not selected_setores or setores_df is None or setores_df.empty:
+        return set()
+
+    selected_rows = setores_df[setores_df["SETOR"].isin(selected_setores)]
+    target_leaders = set(selected_rows["LIDERMAT"].tolist())
+    valid_ids = set(df["MAT"].tolist())
+
+    children_map: dict[str, list[str]] = defaultdict(list)
+    parent_map: dict[str, str] = {}
+    for _, row in df.iterrows():
+        child = row["MAT"]
+        parent = row["LIDER"]
+        if parent and parent != child:
+            children_map[parent].append(child)
+            if child not in parent_map:
+                parent_map[child] = parent
+
+    include_ids: set[str] = set()
+    for leader in target_leaders:
+        if leader not in valid_ids:
+            continue
+
+        include_ids.add(leader)
+
+        stack = [leader]
+        while stack:
+            cur = stack.pop()
+            for child in children_map.get(cur, []):
+                if child not in include_ids:
+                    include_ids.add(child)
+                    stack.append(child)
+
+        seen: set[str] = set()
+        cur = leader
+        while cur in parent_map and cur not in seen:
+            seen.add(cur)
+            parent = parent_map[cur]
+            include_ids.add(parent)
+            cur = parent
+
+    return include_ids
+
+
+def get_sector_descendant_ids(
+    df: pd.DataFrame,
+    setores_df: pd.DataFrame,
+    selected_setores: list[str],
+) -> set[str]:
+    if not selected_setores or setores_df is None or setores_df.empty:
+        return set()
+
+    selected_rows = setores_df[setores_df["SETOR"].isin(selected_setores)]
+    target_leaders = set(selected_rows["LIDERMAT"].tolist())
+    valid_ids = set(df["MAT"].tolist())
+
+    children_map: dict[str, list[str]] = defaultdict(list)
+    for _, row in df.iterrows():
+        child = row["MAT"]
+        parent = row["LIDER"]
+        if parent and parent != child:
+            children_map[parent].append(child)
+
+    descendants: set[str] = set()
+    for leader in target_leaders:
+        if leader not in valid_ids:
+            continue
+
+        stack = list(children_map.get(leader, []))
+        while stack:
+            cur = stack.pop()
+            if cur in descendants:
+                continue
+            descendants.add(cur)
+            stack.extend(children_map.get(cur, []))
+
+    return descendants
+
+
 def build_graph(
     df: pd.DataFrame,
     selected_posicoes: list[str],
@@ -163,43 +252,7 @@ def build_graph(
     selected_setores = selected_setores or []
 
     if selected_setores and setores_df is not None and not setores_df.empty:
-        selected_rows = setores_df[setores_df["SETOR"].isin(selected_setores)]
-        target_leaders = set(selected_rows["LIDERMAT"].tolist())
-
-        children_map: dict[str, list[str]] = defaultdict(list)
-        parent_map: dict[str, str] = {}
-        for _, row in df.iterrows():
-            child = row["MAT"]
-            parent = row["LIDER"]
-            if parent and parent != child:
-                children_map[parent].append(child)
-                if child not in parent_map:
-                    parent_map[child] = parent
-
-        include_ids: set[str] = set()
-        for leader in target_leaders:
-            if leader not in set(df["MAT"]):
-                continue
-
-            include_ids.add(leader)
-
-            # Include all descendants under selected sector leader.
-            stack = [leader]
-            while stack:
-                cur = stack.pop()
-                for child in children_map.get(cur, []):
-                    if child not in include_ids:
-                        include_ids.add(child)
-                        stack.append(child)
-
-            # Include full chain of leaders up to top management/CEO.
-            seen: set[str] = set()
-            cur = leader
-            while cur in parent_map and cur not in seen:
-                seen.add(cur)
-                parent = parent_map[cur]
-                include_ids.add(parent)
-                cur = parent
+        include_ids = get_sector_scope_ids(df, setores_df, selected_setores)
 
         work = df[df["MAT"].isin(include_ids)].copy()
     else:
@@ -240,6 +293,188 @@ def build_graph(
             work = pd.concat([work, fallback], ignore_index=True).drop_duplicates("MAT")
 
     return work, edge_count, highlighted_ids
+
+
+def build_span_ranking(work: pd.DataFrame) -> pd.DataFrame:
+    ids = set(work["MAT"].tolist())
+    if not ids:
+        return pd.DataFrame(columns=["MAT", "NOME", "CARGO", "SPAN"])
+
+    spans: dict[str, int] = defaultdict(int)
+    for _, row in work.iterrows():
+        parent = row["LIDER"]
+        child = row["MAT"]
+        if parent and parent in ids and parent != child:
+            spans[parent] += 1
+
+    if not spans:
+        return pd.DataFrame(columns=["MAT", "NOME", "CARGO", "SPAN"])
+
+    leaders = work[work["MAT"].isin(spans.keys())][["MAT", "NOME", "CARGO"]].drop_duplicates("MAT")
+    leaders["SPAN"] = leaders["MAT"].map(spans).fillna(0).astype(int)
+
+    return leaders.sort_values(by=["SPAN", "NOME"], ascending=[False, True]).reset_index(drop=True)
+
+
+def _build_maps(work: pd.DataFrame) -> tuple[set[str], dict[str, str], dict[str, list[str]]]:
+    ids = set(work["MAT"].tolist())
+    parent_map: dict[str, str] = {}
+    children_map: dict[str, list[str]] = defaultdict(list)
+
+    for _, row in work.iterrows():
+        child = row["MAT"]
+        parent = row["LIDER"]
+        if parent and parent in ids and parent != child:
+            parent_map[child] = parent
+            children_map[parent].append(child)
+
+    for parent in children_map:
+        children_map[parent].sort()
+
+    return ids, parent_map, children_map
+
+
+def generate_reorg_suggestions(work: pd.DataFrame) -> list[dict]:
+    if work.empty:
+        return []
+
+    ids, parent_map, children_map = _build_maps(work)
+    spans = {node: len(children_map.get(node, [])) for node in ids}
+    leaders = [node for node, span in spans.items() if span > 0]
+    if not leaders:
+        return []
+
+    people = work.drop_duplicates("MAT").set_index("MAT")
+
+    def person_name(mat: str) -> str:
+        if mat in people.index:
+            return str(people.loc[mat, "NOME"])
+        return mat
+
+    def person_role(mat: str) -> str:
+        if mat in people.index:
+            return str(people.loc[mat, "CARGO"])
+        return ""
+
+    positive_spans = [spans[node] for node in leaders if spans[node] > 0]
+    span_median = int(round(statistics.median(positive_spans))) if positive_spans else 0
+    split_target = max(4, span_median)
+
+    suggestions: list[dict] = []
+
+    for leader in sorted(leaders, key=lambda x: (-spans[x], person_name(x))):
+        span = spans[leader]
+        direct_reports = list(children_map.get(leader, []))
+        if span < split_target + 3 or len(direct_reports) < 4:
+            continue
+
+        candidate = max(direct_reports, key=lambda x: (spans.get(x, 0), person_name(x)))
+        movable = [node for node in sorted(direct_reports, key=lambda x: (spans.get(x, 0), person_name(x))) if node != candidate]
+        move_count = max(2, min(len(movable), span - split_target))
+        moved_ids = movable[:move_count]
+        if len(moved_ids) < 2:
+            continue
+
+        suggestions.append(
+            {
+                "kind": "split",
+                "title": f"Split da area de {person_name(leader)}",
+                "summary": (
+                    f"{person_name(leader)} possui span {span}. Repassar {len(moved_ids)} liderados para "
+                    f"{person_name(candidate)} reduziria o span para {span - len(moved_ids)}."
+                ),
+                "leader_id": leader,
+                "candidate_id": candidate,
+                "moved_ids": moved_ids,
+                "focus_ids": [leader, candidate, *moved_ids],
+                "impact": len(moved_ids),
+            }
+        )
+        if len([s for s in suggestions if s["kind"] == "split"]) >= 4:
+            break
+
+    for parent, kids in children_map.items():
+        child_leaders = [node for node in kids if spans.get(node, 0) > 0]
+        low_span_leaders = [node for node in child_leaders if spans.get(node, 0) <= 2]
+        if len(low_span_leaders) < 2:
+            continue
+
+        low_span_leaders = sorted(low_span_leaders, key=lambda x: (spans.get(x, 0), person_name(x)))
+        primary = low_span_leaders[0]
+        secondary = low_span_leaders[1]
+        moved_ids = list(children_map.get(secondary, []))
+        if not moved_ids:
+            continue
+
+        suggestions.append(
+            {
+                "kind": "merge",
+                "title": f"Merge das frentes de {person_name(primary)} e {person_name(secondary)}",
+                "summary": (
+                    f"Ambos respondem para {person_name(parent)} e operam com baixo span. "
+                    f"Unificar {len(moved_ids)} liderados de {person_name(secondary)} sob {person_name(primary)} "
+                    f"pode simplificar a estrutura."
+                ),
+                "parent_id": parent,
+                "primary_id": primary,
+                "secondary_id": secondary,
+                "moved_ids": moved_ids,
+                "focus_ids": [parent, primary, secondary, *moved_ids],
+                "impact": len(moved_ids),
+            }
+        )
+        if len([s for s in suggestions if s["kind"] == "merge"]) >= 4:
+            break
+
+    suggestions.sort(key=lambda x: (-int(x.get("impact", 0)), x.get("title", "")))
+    return suggestions[:8]
+
+
+def apply_reorg_suggestion(work: pd.DataFrame, suggestion: dict) -> pd.DataFrame:
+    proposed = work.copy()
+    kind = str(suggestion.get("kind", ""))
+
+    if kind == "split":
+        candidate_id = str(suggestion.get("candidate_id", ""))
+        moved_ids = set(suggestion.get("moved_ids", []))
+        proposed.loc[proposed["MAT"].isin(moved_ids), "LIDER"] = candidate_id
+    elif kind == "merge":
+        primary_id = str(suggestion.get("primary_id", ""))
+        moved_ids = set(suggestion.get("moved_ids", []))
+        proposed.loc[proposed["MAT"].isin(moved_ids), "LIDER"] = primary_id
+
+    return proposed
+
+
+def build_focus_scope(work: pd.DataFrame, focus_ids: list[str], up_levels: int = 1, down_levels: int = 3) -> set[str]:
+    ids, parent_map, children_map = _build_maps(work)
+    seeds = [node for node in focus_ids if node in ids]
+    if not seeds:
+        return set(ids)
+
+    selected: set[str] = set(seeds)
+
+    q_up = deque((node, 0) for node in seeds)
+    while q_up:
+        node, depth = q_up.popleft()
+        if depth >= up_levels:
+            continue
+        parent = parent_map.get(node)
+        if parent and parent not in selected:
+            selected.add(parent)
+            q_up.append((parent, depth + 1))
+
+    q_down = deque((node, 0) for node in seeds)
+    while q_down:
+        node, depth = q_down.popleft()
+        if depth >= down_levels:
+            continue
+        for child in children_map.get(node, []):
+            if child not in selected:
+                selected.add(child)
+                q_down.append((child, depth + 1))
+
+    return selected
 
 
 def build_pyvis_network(work: pd.DataFrame, direction: str = "UD", highlighted_ids: set[str] | None = None) -> Network:
@@ -504,13 +739,13 @@ def build_pyvis_network(work: pd.DataFrame, direction: str = "UD", highlighted_i
     return net
 
 
-def render_pyvis(net: Network) -> None:
+def render_pyvis(net: Network, height: int = 780) -> None:
     with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False, encoding="utf-8") as f:
         net.write_html(f.name)
         html_path = Path(f.name)
 
     html_content = html_path.read_text(encoding="utf-8")
-    st.components.v1.html(html_content, height=780, scrolling=True)
+    st.components.v1.html(html_content, height=height, scrolling=True)
     html_path.unlink(missing_ok=True)
 
 
@@ -534,20 +769,76 @@ def main():
     posicoes = sorted([p for p in df["POSICAO"].dropna().unique() if p])
     setores = sorted([s for s in setores_df["SETOR"].dropna().unique() if s]) if not setores_df.empty else []
 
-    st.sidebar.header("Filtros")
-    selected_setores = st.sidebar.multiselect(
-        "Setor",
-        options=setores,
-        default=[],
-        help="Mostra lider do setor, todos os liderados e o caminho de lideranca ate o CEO.",
-    )
-    selected_posicoes = st.sidebar.multiselect(
-        "Posicao",
-        options=posicoes,
-        default=posicoes,
-        help="Filtre por nivel/posicao no organograma (aplicado quando Setor nao estiver selecionado).",
-    )
-    search = st.sidebar.text_input("Buscar por nome, cargo ou MAT", "")
+    if "sidebar_view" not in st.session_state:
+        st.session_state["sidebar_view"] = "filters"
+    if "selected_setores" not in st.session_state:
+        st.session_state["selected_setores"] = []
+    if "selected_posicoes" not in st.session_state:
+        st.session_state["selected_posicoes"] = posicoes
+    if "search_text" not in st.session_state:
+        st.session_state["search_text"] = ""
+    if "selected_suggestion_idx" not in st.session_state:
+        st.session_state["selected_suggestion_idx"] = 0
+
+    sidebar_view = str(st.session_state.get("sidebar_view", "filters"))
+
+    if sidebar_view == "filters":
+        st.sidebar.header("Filtros")
+        selected_setores = st.sidebar.multiselect(
+            "Setor",
+            options=setores,
+            default=st.session_state.get("selected_setores", []),
+            key="selected_setores",
+            help="Mostra lider do setor, todos os liderados e o caminho de lideranca ate o CEO.",
+        )
+        selected_posicoes = st.sidebar.multiselect(
+            "Posicao",
+            options=posicoes,
+            default=st.session_state.get("selected_posicoes", posicoes),
+            key="selected_posicoes",
+            help="Filtre por nivel/posicao no organograma (aplicado quando Setor nao estiver selecionado).",
+        )
+        search = st.sidebar.text_input("Buscar por nome, cargo ou MAT", key="search_text")
+
+        if selected_setores and not setores_df.empty:
+            sector_ids = get_sector_descendant_ids(df, setores_df, selected_setores)
+            cargos_setor = sorted(
+                [c for c in df[df["MAT"].isin(sector_ids)]["CARGO"].dropna().unique() if c]
+            )
+            st.sidebar.markdown("**Cargos existentes no(s) setor(es):**")
+            if cargos_setor:
+                st.sidebar.caption("\n".join(f"- {cargo}" for cargo in cargos_setor))
+            else:
+                st.sidebar.caption("Nenhum cargo encontrado para o(s) setor(es) selecionado(s).")
+
+        if st.sidebar.button("Mostrar ranking de span", use_container_width=True):
+            st.session_state["sidebar_view"] = "ranking"
+            st.rerun()
+        if st.sidebar.button("Mostrar sugestoes de split/merge", use_container_width=True):
+            st.session_state["sidebar_view"] = "suggestions"
+            st.rerun()
+    elif sidebar_view == "ranking":
+        st.sidebar.header("Ranking de Span")
+        selected_setores = st.session_state.get("selected_setores", [])
+        selected_posicoes = st.session_state.get("selected_posicoes", posicoes)
+        search = st.session_state.get("search_text", "")
+        if st.sidebar.button("Voltar para filtros", use_container_width=True):
+            st.session_state["sidebar_view"] = "filters"
+            st.rerun()
+        if st.sidebar.button("Ir para sugestoes", use_container_width=True):
+            st.session_state["sidebar_view"] = "suggestions"
+            st.rerun()
+    else:
+        st.sidebar.header("Sugestoes")
+        selected_setores = st.session_state.get("selected_setores", [])
+        selected_posicoes = st.session_state.get("selected_posicoes", posicoes)
+        search = st.session_state.get("search_text", "")
+        if st.sidebar.button("Voltar para filtros", use_container_width=True):
+            st.session_state["sidebar_view"] = "filters"
+            st.rerun()
+        if st.sidebar.button("Ir para ranking", use_container_width=True):
+            st.session_state["sidebar_view"] = "ranking"
+            st.rerun()
 
     _, top_right = st.columns([8, 2])
     with top_right:
@@ -560,6 +851,88 @@ def main():
         setores_df=setores_df,
         selected_setores=selected_setores,
     )
+    direction = "LR" if horizontal_view else "UD"
+    ranking_df = build_span_ranking(filtered)
+    suggestions = generate_reorg_suggestions(filtered)
+
+    if sidebar_view == "ranking":
+        st.sidebar.markdown("**Lideres por span (maior para menor)**")
+        if ranking_df.empty:
+            st.sidebar.caption("Nenhum lider com span encontrado no recorte atual.")
+        else:
+            st.sidebar.markdown(
+                """
+                <style>
+                .span-card {
+                    border: 1px solid rgba(20, 49, 94, 0.15);
+                    border-left: 6px solid #14315E;
+                    border-radius: 10px;
+                    padding: 0.6rem 0.7rem;
+                    margin-bottom: 0.55rem;
+                    background: linear-gradient(180deg, rgba(47,214,139,0.08), rgba(20,49,94,0.02));
+                }
+                .span-card-name {
+                    color: #14315E;
+                    font-weight: 700;
+                    margin: 0;
+                    font-size: 0.94rem;
+                    line-height: 1.25;
+                }
+                .span-card-role {
+                    color: #2b3f66;
+                    margin: 0.2rem 0 0.4rem 0;
+                    font-size: 0.82rem;
+                    line-height: 1.25;
+                }
+                .span-card-badge {
+                    display: inline-block;
+                    background: #14315E;
+                    color: #FFFFFF;
+                    border-radius: 999px;
+                    padding: 0.14rem 0.52rem;
+                    font-size: 0.78rem;
+                    font-weight: 700;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            for _, row in ranking_df.iterrows():
+                nome = html.escape(str(row.get("NOME", "")))
+                cargo = html.escape(str(row.get("CARGO", "")))
+                span = int(row.get("SPAN", 0))
+                st.sidebar.markdown(
+                    f"""
+                    <div class="span-card">
+                        <p class="span-card-name">{nome}</p>
+                        <p class="span-card-role">{cargo}</p>
+                        <span class="span-card-badge">Span: {span}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+    elif sidebar_view == "suggestions":
+        st.sidebar.markdown("**Sugestoes de split/merge (baseado em span e estrutura atual)**")
+        if not suggestions:
+            st.sidebar.caption("Nenhuma sugestao encontrada para o recorte atual.")
+        else:
+            selected_idx = int(st.session_state.get("selected_suggestion_idx", 0))
+            if selected_idx < 0 or selected_idx >= len(suggestions):
+                selected_idx = 0
+                st.session_state["selected_suggestion_idx"] = 0
+
+            for idx, suggestion in enumerate(suggestions):
+                title = str(suggestion.get("title", "Sugestao"))
+                summary = str(suggestion.get("summary", ""))
+                impact = int(suggestion.get("impact", 0))
+                is_selected = idx == selected_idx
+                button_label = f"{idx + 1}. {title}"
+                if st.sidebar.button(button_label, key=f"suggestion_btn_{idx}", use_container_width=True):
+                    st.session_state["selected_suggestion_idx"] = idx
+                    st.rerun()
+                st.sidebar.caption(f"{'Selecionada' if is_selected else 'Clique para abrir'} | Impacto: {impact}")
+                st.sidebar.caption(summary)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Total de pessoas", f"{len(df)}")
@@ -572,8 +945,41 @@ def main():
         st.warning("Nenhum resultado para os filtros selecionados.")
         return
 
+    if sidebar_view == "suggestions" and suggestions:
+        selected_idx = int(st.session_state.get("selected_suggestion_idx", 0))
+        if selected_idx < 0 or selected_idx >= len(suggestions):
+            selected_idx = 0
+            st.session_state["selected_suggestion_idx"] = 0
+
+        selected_suggestion = suggestions[selected_idx]
+        st.subheader("Sugestao de reorganizacao")
+        st.write(
+            {
+                "Titulo": selected_suggestion.get("title", ""),
+                "Resumo": selected_suggestion.get("summary", ""),
+                "Tipo": selected_suggestion.get("kind", ""),
+                "Impacto": int(selected_suggestion.get("impact", 0)),
+            }
+        )
+
+        current_focus_ids = build_focus_scope(filtered, list(selected_suggestion.get("focus_ids", [])))
+        current_focus = filtered[filtered["MAT"].isin(current_focus_ids)].copy()
+
+        proposed = apply_reorg_suggestion(filtered, selected_suggestion)
+        proposed_focus_ids = build_focus_scope(proposed, list(selected_suggestion.get("focus_ids", [])))
+        proposed_focus = proposed[proposed["MAT"].isin(proposed_focus_ids)].copy()
+
+        left_col, right_col = st.columns(2)
+        with left_col:
+            st.markdown("**Como esta hoje (foco na area da mudanca)**")
+            net_current = build_pyvis_network(current_focus, direction=direction, highlighted_ids=highlighted_ids)
+            render_pyvis(net_current, height=520)
+        with right_col:
+            st.markdown("**Como ficaria com a sugestao aplicada**")
+            net_proposed = build_pyvis_network(proposed_focus, direction=direction, highlighted_ids=highlighted_ids)
+            render_pyvis(net_proposed, height=520)
+
     st.subheader("Visualizacao")
-    direction = "LR" if horizontal_view else "UD"
     net = build_pyvis_network(filtered, direction=direction, highlighted_ids=highlighted_ids)
     render_pyvis(net)
 
