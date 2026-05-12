@@ -1,4 +1,4 @@
-import tempfile
+﻿import tempfile
 import json
 import base64
 import html
@@ -792,7 +792,13 @@ def build_pyvis_network(
         return f"#{rr:02x}{rg:02x}{rb:02x}"
 
     is_horizontal = direction == "LR"
-    net = Network(height="760px", width="100%", directed=True, notebook=False)
+    net = Network(
+        height="760px",
+        width="100%",
+        directed=True,
+        notebook=False,
+        cdn_resources="in_line",
+    )
 
     def sort_key(node_id: str) -> tuple:
         org = node_org.get(node_id, {})
@@ -908,6 +914,8 @@ def build_pyvis_network(
     slot: dict[str, float] = {}
     cursor = 0.0
     tree_gap_slots = 1.6
+    sector_gap_slots = 0.45
+    subsetor_gap_slots = 0.55
 
     def place(node_id: str) -> None:
         nonlocal cursor
@@ -917,8 +925,26 @@ def build_pyvis_network(
             cursor += 1.0
             return
         first_cursor = cursor
+        previous_sector = ""
+        previous_subsetor = ""
         for child in kids:
+            child_sector = node_org.get(child, {}).get("setor", "")
+            child_subsetor = node_org.get(child, {}).get("subsetor", "")
+            if previous_sector and child_sector and child_sector != previous_sector:
+                cursor += sector_gap_slots
+            elif (
+                previous_sector
+                and child_sector == previous_sector
+                and previous_subsetor
+                and child_subsetor
+                and child_subsetor != previous_subsetor
+            ):
+                cursor += subsetor_gap_slots
             place(child)
+            if child_sector:
+                previous_sector = child_sector
+            if child_subsetor:
+                previous_subsetor = child_subsetor
         slot[node_id] = (first_cursor + (cursor - 1.0)) / 2.0
 
     for idx, root in enumerate(roots):
@@ -936,7 +962,226 @@ def build_pyvis_network(
         sibling_gap = 220
     else:
         level_gap = 340
-        sibling_gap = 360
+        sibling_gap = 240
+
+    def node_primary_half_width(node_id: str) -> float:
+        payload = node_payload.get(node_id, {})
+        label = str(payload.get("label", ""))
+        longest_line = max((len(line) for line in label.split("\n")), default=0)
+        text_width = longest_line * 7.2
+        node_width = (max(payload.get("size", 22), 30) if payload.get("is_highlighted") else payload.get("size", 22)) * 2.0
+        return max(48.0, text_width / 2.0, node_width)
+
+    def node_gap_slots(left_id: str, right_id: str, gap_px: float = 22.0) -> float:
+        return (node_primary_half_width(left_id) + node_primary_half_width(right_id) + gap_px) / sibling_gap
+
+    def shift_subtree_slots(node_id: str, delta: float) -> None:
+        slot[node_id] = slot.get(node_id, 0.0) + delta
+        for child_id in children.get(node_id, []):
+            shift_subtree_slots(child_id, delta)
+
+    def compact_operational_under_mixed_parents() -> None:
+        for parent in sorted(children, key=lambda node_id: depth.get(node_id, 0)):
+            kids = children.get(parent, [])
+            if not kids or not mixed_level_parent.get(parent) or parent not in slot:
+                continue
+            operational = [child for child in kids if position_rank(child) == 2 and child_level_gap(parent, child) > 1]
+            if not operational:
+                continue
+            operational.sort(key=sort_key)
+            spacing = 0.68
+            start = slot[parent] - ((len(operational) - 1) * spacing / 2.0)
+            for index, child in enumerate(operational):
+                target = start + (index * spacing)
+                shift_subtree_slots(child, target - slot.get(child, target))
+
+    def enforce_level_spacing(min_gap_slots: float = 0.64) -> None:
+        nodes_by_depth: dict[int, list[str]] = defaultdict(list)
+        for node_id, node_depth in depth.items():
+            if node_id in slot:
+                nodes_by_depth[node_depth].append(node_id)
+        for node_depth in sorted(nodes_by_depth):
+            ordered = sorted(nodes_by_depth[node_depth], key=lambda node_id: (slot.get(node_id, 0.0), sort_key(node_id)))
+            previous_node: str | None = None
+            for node_id in ordered:
+                current = slot.get(node_id, 0.0)
+                if previous_node is not None:
+                    required_gap = max(min_gap_slots, node_gap_slots(previous_node, node_id))
+                    previous_slot = slot.get(previous_node, current)
+                    if current - previous_slot < required_gap:
+                        delta = (previous_slot + required_gap) - current
+                        shift_subtree_slots(node_id, delta)
+                        current += delta
+                previous_node = node_id
+
+    def enforce_sibling_text_spacing(gap_px: float = 18.0) -> None:
+        for parent in sorted(children, key=lambda node_id: depth.get(node_id, 0), reverse=True):
+            kids = [child for child in children.get(parent, []) if child in slot]
+            if len(kids) < 2:
+                continue
+            kids.sort(key=lambda node_id: (slot.get(node_id, 0.0), sort_key(node_id)))
+            previous = kids[0]
+            for child in kids[1:]:
+                required_gap = node_gap_slots(previous, child, gap_px)
+                actual_gap = slot.get(child, 0.0) - slot.get(previous, 0.0)
+                if actual_gap < required_gap:
+                    delta = required_gap - actual_gap
+                    shift_subtree_slots(child, delta)
+                previous = child
+
+    compact_operational_under_mixed_parents()
+    enforce_sibling_text_spacing()
+    enforce_level_spacing()
+
+    def compact_subsetor_roots(spacing_slots: float = 0.72) -> None:
+        groups = subsetor_nodes()
+        if not groups:
+            return
+        for nodes in groups.values():
+            node_set = set(nodes)
+            roots_in_group = [
+                node_id
+                for node_id in nodes
+                if node_id in slot and parent_of.get(node_id) not in node_set
+            ]
+            if len(roots_in_group) < 2:
+                continue
+            roots_in_group.sort(key=lambda node_id: (position_rank(node_id), slot.get(node_id, 0.0), sort_key(node_id)))
+            center = sum(slot[node_id] for node_id in roots_in_group) / len(roots_in_group)
+            start = center - ((len(roots_in_group) - 1) * spacing_slots / 2.0)
+            for index, node_id in enumerate(roots_in_group):
+                target = start + (index * spacing_slots)
+                shift_subtree_slots(node_id, target - slot.get(node_id, target))
+
+    def keep_leaders_off_parent_axis(clearance_slots: float = 0.42) -> None:
+        for parent in sorted(children, key=lambda node_id: depth.get(node_id, 0), reverse=True):
+            kids = children.get(parent, [])
+            if len(kids) < 2 or parent not in slot:
+                continue
+            parent_axis = slot[parent]
+            for index, child in enumerate(kids):
+                is_tactical_under_strategic = position_rank(parent) == 0 and position_rank(child) == 1
+                if not children.get(child) and not is_tactical_under_strategic:
+                    continue
+                if abs(slot.get(child, 0.0) - parent_axis) > 0.03:
+                    continue
+                direction_sign = -1.0 if index < len(kids) / 2 else 1.0
+                required_clearance = max(clearance_slots, (node_primary_half_width(parent) + node_primary_half_width(child) + 18.0) / sibling_gap)
+                shift_subtree_slots(child, direction_sign * required_clearance)
+
+    keep_leaders_off_parent_axis()
+    enforce_sibling_text_spacing()
+    enforce_level_spacing()
+
+    def sector_nodes() -> dict[str, list[str]]:
+        groups: dict[str, list[str]] = defaultdict(list)
+        for node_id in graph.nodes:
+            setor = node_org.get(node_id, {}).get("setor", "")
+            if setor:
+                groups[setor].append(node_id)
+        return groups
+
+    def subsetor_nodes() -> dict[str, list[str]]:
+        groups: dict[str, list[str]] = defaultdict(list)
+        for node_id in graph.nodes:
+            org = node_org.get(node_id, {})
+            setor = org.get("setor", "")
+            subsetor = org.get("subsetor", "")
+            if setor and subsetor:
+                groups[f"{setor}||{subsetor}"].append(node_id)
+        return groups
+
+    def supersetor_nodes() -> dict[str, list[str]]:
+        groups: dict[str, list[str]] = defaultdict(list)
+        for node_id in graph.nodes:
+            supersetor = node_org.get(node_id, {}).get("supersetor", "")
+            if supersetor:
+                groups[supersetor].append(node_id)
+        return groups
+
+    def separate_group_slots(
+        groups: dict[str, list[str]],
+        *,
+        primary_padding: float,
+        secondary_padding_before: float,
+        secondary_padding_after: float,
+        gap: float,
+    ) -> None:
+        if len(groups) < 2:
+            return
+        radius_by_node = {node_id: node_primary_half_width(node_id) for node_id in graph.nodes}
+
+        def make_box(name: str, nodes: list[str]) -> dict[str, float | str]:
+            primary_values: list[float] = []
+            secondary_values: list[float] = []
+            radii: list[float] = []
+            for node_id in nodes:
+                if node_id not in slot or node_id not in depth:
+                    continue
+                primary_values.append(slot[node_id] * sibling_gap)
+                secondary_values.append(depth[node_id] * level_gap)
+                radii.append(radius_by_node.get(node_id, 58.0))
+            if not primary_values or not secondary_values:
+                return {}
+            max_radius = max(radii or [58.0])
+            return {
+                "name": name,
+                "primary_min": min(primary_values) - max_radius - primary_padding,
+                "primary_max": max(primary_values) + max_radius + primary_padding,
+                "secondary_min": min(secondary_values) - max_radius - secondary_padding_before,
+                "secondary_max": max(secondary_values) + max_radius + secondary_padding_after,
+            }
+
+        for _ in range(4):
+            boxes = [box for name, nodes in groups.items() if (box := make_box(name, nodes))]
+            boxes.sort(key=lambda box: ((box["primary_min"] + box["primary_max"]) / 2, sort_text(str(box["name"]))))
+            moved = False
+            for index in range(1, len(boxes)):
+                previous = boxes[index - 1]
+                current = boxes[index]
+                secondary_overlap = previous["secondary_max"] > current["secondary_min"] and current["secondary_max"] > previous["secondary_min"]
+                if not secondary_overlap:
+                    continue
+                overlap = previous["primary_max"] + gap - current["primary_min"]
+                if overlap <= 0:
+                    continue
+                delta_slots = overlap / sibling_gap
+                for node_id in groups.get(str(current["name"]), []):
+                    slot[node_id] = slot.get(node_id, 0.0) + delta_slots
+                moved = True
+            if not moved:
+                break
+
+    compact_subsetor_roots()
+    enforce_sibling_text_spacing()
+    enforce_level_spacing()
+    separate_group_slots(
+        subsetor_nodes(),
+        primary_padding=18,
+        secondary_padding_before=18,
+        secondary_padding_after=30,
+        gap=18,
+    )
+    enforce_sibling_text_spacing()
+    enforce_level_spacing()
+    separate_group_slots(
+        sector_nodes(),
+        primary_padding=26,
+        secondary_padding_before=24,
+        secondary_padding_after=42,
+        gap=24,
+    )
+    enforce_sibling_text_spacing()
+    enforce_level_spacing()
+    separate_group_slots(
+        supersetor_nodes(),
+        primary_padding=30,
+        secondary_padding_before=28,
+        secondary_padding_after=44,
+        gap=36,
+    )
+    enforce_sibling_text_spacing()
+    enforce_level_spacing()
 
     positions: dict[str, tuple[float, float]] = {}
     for node in graph.nodes:
@@ -1121,64 +1366,22 @@ def render_pyvis(
     height: int = 780,
     initial_scale: float = 0.42,
 ) -> None:
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False, encoding="utf-8") as f:
-        net.write_html(f.name)
-        html_path = Path(f.name)
+    html_content = net.generate_html(notebook=False)
+    def json_for_script(value: object) -> str:
+        return (
+            json.dumps(value, ensure_ascii=False)
+            .replace("</", "<\\/")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029")
+        )
 
-    html_content = html_path.read_text(encoding="utf-8")
-    container_json = json.dumps(containers or {}, ensure_ascii=False).replace("</", "<\\/")
-    editor_json = json.dumps(getattr(net, "org_editor_data", {}), ensure_ascii=False).replace("</", "<\\/")
+    container_json = json_for_script(containers or {})
+    editor_json = json_for_script(getattr(net, "org_editor_data", {}))
     initial_scale_json = json.dumps(initial_scale)
     
     # Adicionar CSS e JavaScript customizados para renderizar containers
     container_styles = """
     <style>
-    .network-container-overlay {
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        pointer-events: none;
-        z-index: 5;
-    }
-    
-    .container-svg {
-        width: 100%;
-        height: 100%;
-        position: absolute;
-        top: 0;
-        left: 0;
-    }
-    
-    .container-rect-supersetor {
-        fill: rgba(20, 49, 94, 0.04);
-        stroke: rgba(20, 49, 94, 0.25);
-        stroke-width: 2;
-        stroke-dasharray: 5,5;
-    }
-    
-    .container-rect-setor {
-        fill: rgba(47, 214, 139, 0.08);
-        stroke: rgba(47, 214, 139, 0.6);
-        stroke-width: 2;
-    }
-    
-    .container-rect-subsetor {
-        fill: transparent;
-        stroke: rgba(20, 49, 94, 0.35);
-        stroke-width: 1.5;
-        stroke-dasharray: 3,3;
-    }
-    
-    .container-label {
-        font-size: 11px;
-        font-weight: 700;
-        fill: #14315E;
-        font-family: Arial, sans-serif;
-        pointer-events: none;
-    }
-
     .collab-modal-backdrop {
         position: absolute;
         inset: 0;
@@ -1300,58 +1503,38 @@ def render_pyvis(
     
     <script>
     (function() {
-        const containerData = """ + container_json + """;
         const editorData = """ + editor_json + """;
         const initialScale = """ + initial_scale_json + """;
-        let redrawHandle = null;
+        const MIN_ZOOM_LEVEL = 0.18;
+        const MAX_ZOOM_LEVEL = 2.5;
         let eventsBound = false;
         let initialViewApplied = false;
         let modalInstalled = false;
-        let currentModalId = null;
-        const storageKey = 'organograma_colaborador_changes_v1';
-        const undoStack = [];
+        let isClampingZoom = false;
 
         function getVisNetwork() {
-            if (typeof network !== 'undefined' && network && typeof network.canvasToDOM === 'function') {
-                return network;
-            }
-            if (window.network && typeof window.network.canvasToDOM === 'function') {
-                return window.network;
-            }
+            if (typeof network !== 'undefined' && network && typeof network.redraw === 'function') return network;
+            if (window.network && typeof window.network.redraw === 'function') return window.network;
             return null;
         }
 
-        function scheduleContainers() {
-            if (redrawHandle) {
-                window.cancelAnimationFrame(redrawHandle);
-            }
-            redrawHandle = window.requestAnimationFrame(setupContainers);
+        function getNodesDataset() {
+            if (typeof nodes !== 'undefined' && nodes) return nodes;
+            return window.nodes || null;
         }
 
-        function bindNetworkEvents(visNetwork) {
-            if (eventsBound || !visNetwork || typeof visNetwork.on !== 'function') return;
-            eventsBound = true;
-            ['afterDrawing', 'zoom', 'dragEnd', 'animationFinished', 'stabilized', 'resize'].forEach(eventName => {
-                visNetwork.on(eventName, scheduleContainers);
-            });
-            window.addEventListener('resize', scheduleContainers);
+        function realGraphNodes() {
+            const ds = getNodesDataset();
+            if (!ds) return [];
+            return ds.get().filter(node => !String(node.id).startsWith('__bend_') && node.collaborator);
         }
 
-        function getContainerNodeIds() {
-            const ids = new Set();
-            Object.values(buildCurrentContainerData() || {}).forEach(groups => {
-                Object.values(groups || {}).forEach(nodes => {
-                    (nodes || []).forEach(node => {
-                        if (node && node.id && !String(node.id).startsWith('__bend_')) {
-                            ids.add(node.id);
-                        }
-                    });
-                });
-            });
-            return Array.from(ids);
+        function scheduleRedraw() {
+            const visNetwork = getVisNetwork();
+            if (visNetwork && typeof visNetwork.redraw === 'function') visNetwork.redraw();
         }
 
-        function buildCurrentContainerData() {
+        function currentContainers() {
             const data = { supersetor: {}, setor: {}, subsetor: {} };
             realGraphNodes().forEach(node => {
                 const details = node.collaborator || {};
@@ -1361,10 +1544,9 @@ def render_pyvis(
                     y: Number(node.y) || 0,
                     size: Number(node.size) || 22
                 };
-                const supersetor = details.supersetor || '';
-                if (supersetor) {
-                    if (!data.supersetor[supersetor]) data.supersetor[supersetor] = [];
-                    data.supersetor[supersetor].push(item);
+                if (details.supersetor) {
+                    if (!data.supersetor[details.supersetor]) data.supersetor[details.supersetor] = [];
+                    data.supersetor[details.supersetor].push(item);
                 }
                 if (details.setor) {
                     if (!data.setor[details.setor]) data.setor[details.setor] = [];
@@ -1378,480 +1560,191 @@ def render_pyvis(
             return data;
         }
 
+        function nodeCanvasBox(visNetwork, node) {
+            if (!node) return null;
+            try {
+                if (visNetwork && typeof visNetwork.getBoundingBox === 'function') {
+                    const box = visNetwork.getBoundingBox(node.id);
+                    if (box && Number.isFinite(box.left) && Number.isFinite(box.right) && Number.isFinite(box.top) && Number.isFinite(box.bottom)) {
+                        return box;
+                    }
+                }
+            } catch (err) {
+                // Fallback below.
+            }
+            const radius = Math.max(42, (Number(node.size) || 22) * 1.7);
+            const x = Number(node.x) || 0;
+            const y = Number(node.y) || 0;
+            return { left: x - radius, right: x + radius, top: y - radius, bottom: y + radius };
+        }
+
+        function buildContainerBox(type, name, nodes, visNetwork) {
+            let minX = Infinity;
+            let maxX = -Infinity;
+            let minY = Infinity;
+            let maxY = -Infinity;
+            let count = 0;
+            nodes.forEach(node => {
+                const box = nodeCanvasBox(visNetwork, node);
+                if (!box) return;
+                minX = Math.min(minX, box.left);
+                maxX = Math.max(maxX, box.right);
+                minY = Math.min(minY, box.top);
+                maxY = Math.max(maxY, box.bottom);
+                count += 1;
+            });
+            if (!count || !Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) return null;
+
+            const padding = {
+                supersetor: { x: 30, top: 28, bottom: 44 },
+                setor: { x: 26, top: 24, bottom: 42 },
+                subsetor: { x: 18, top: 18, bottom: 32 }
+            }[type] || { x: 24, top: 22, bottom: 38 };
+
+            return {
+                type,
+                name,
+                left: minX - padding.x,
+                right: maxX + padding.x,
+                top: minY - padding.top,
+                bottom: maxY + padding.bottom
+            };
+        }
+
+        function roundedRectPath(ctx, x, y, width, height, radius) {
+            const r = Math.max(0, Math.min(radius, Math.abs(width) / 2, Math.abs(height) / 2));
+            ctx.beginPath();
+            ctx.moveTo(x + r, y);
+            ctx.lineTo(x + width - r, y);
+            ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+            ctx.lineTo(x + width, y + height - r);
+            ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+            ctx.lineTo(x + r, y + height);
+            ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+            ctx.lineTo(x, y + r);
+            ctx.quadraticCurveTo(x, y, x + r, y);
+            ctx.closePath();
+        }
+
+        function drawContainerBox(ctx, box, visNetwork) {
+            const styles = {
+                supersetor: { fill: 'rgba(20, 49, 94, 0.04)', stroke: 'rgba(20, 49, 94, 0.25)', width: 2, dash: [18, 18] },
+                setor: { fill: 'rgba(47, 214, 139, 0.08)', stroke: 'rgba(47, 214, 139, 0.6)', width: 2, dash: [] },
+                subsetor: { fill: 'rgba(0, 0, 0, 0)', stroke: 'rgba(20, 49, 94, 0.35)', width: 1.5, dash: [10, 10] }
+            };
+            const style = styles[box.type] || styles.setor;
+            const width = box.right - box.left;
+            const height = box.bottom - box.top;
+            if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+
+            const scale = visNetwork && typeof visNetwork.getScale === 'function' ? visNetwork.getScale() : 1;
+            const fontSize = Math.max(14, Math.min(22, 16 / Math.max(scale, 0.35)));
+            ctx.save();
+            roundedRectPath(ctx, box.left, box.top, width, height, 8);
+            ctx.fillStyle = style.fill;
+            ctx.fill();
+            ctx.strokeStyle = style.stroke;
+            ctx.lineWidth = style.width / Math.max(scale, 0.1);
+            ctx.setLineDash(style.dash);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.font = '800 ' + fontSize + 'px Arial, sans-serif';
+            ctx.fillStyle = '#14315E';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'alphabetic';
+            ctx.fillText(String(box.name || ''), box.left + 10, box.top + 16);
+            ctx.restore();
+        }
+
+        function clampZoom(visNetwork) {
+            if (!visNetwork || typeof visNetwork.getScale !== 'function' || typeof visNetwork.moveTo !== 'function') return;
+            if (isClampingZoom) return;
+            const scale = visNetwork.getScale();
+            if (!Number.isFinite(scale)) return;
+            if (scale >= MIN_ZOOM_LEVEL && scale <= MAX_ZOOM_LEVEL) return;
+            isClampingZoom = true;
+            const targetScale = Math.min(Math.max(scale, MIN_ZOOM_LEVEL), MAX_ZOOM_LEVEL);
+            const position = typeof visNetwork.getViewPosition === 'function' ? visNetwork.getViewPosition() : undefined;
+            visNetwork.moveTo({
+                position: position,
+                scale: targetScale,
+                animation: false
+            });
+            window.setTimeout(function() {
+                isClampingZoom = false;
+            }, 0);
+        }
+
+        function drawContainers(ctx, data, visNetwork) {
+            if (!ctx || !data || !visNetwork) return;
+            ['supersetor', 'setor', 'subsetor'].forEach(type => {
+                Object.keys(data[type] || {}).forEach(name => {
+                    const box = buildContainerBox(type, name, data[type][name], visNetwork);
+                    if (box) drawContainerBox(ctx, box, visNetwork);
+                });
+            });
+        }
+
+        function bindNetworkEvents(visNetwork) {
+            if (eventsBound || !visNetwork || typeof visNetwork.on !== 'function') return;
+            eventsBound = true;
+            visNetwork.on('beforeDrawing', function(ctx) {
+                drawContainers(ctx, currentContainers(), visNetwork);
+            });
+            ['zoom', 'dragEnd', 'animationFinished', 'stabilized', 'resize'].forEach(function(eventName) {
+                visNetwork.on(eventName, function() {
+                    if (eventName === 'zoom') clampZoom(visNetwork);
+                    scheduleRedraw();
+                });
+            });
+            window.addEventListener('resize', scheduleRedraw);
+        }
+
         function applyInitialView(visNetwork) {
             if (initialViewApplied || !Number.isFinite(initialScale) || initialScale <= 0) return;
             initialViewApplied = true;
             window.setTimeout(function() {
-                const nodeIds = getContainerNodeIds();
-                if (!nodeIds.length || typeof visNetwork.getPositions !== 'function') return;
-                const positions = visNetwork.getPositions(nodeIds);
-                let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-                Object.values(positions || {}).forEach(pos => {
-                    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y)) return;
-                    minX = Math.min(minX, pos.x);
-                    maxX = Math.max(maxX, pos.x);
-                    minY = Math.min(minY, pos.y);
-                    maxY = Math.max(maxY, pos.y);
-                });
-                if (!Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) return;
-                visNetwork.moveTo({
-                    position: { x: (minX + maxX) / 2, y: (minY + maxY) / 2 },
-                    scale: initialScale,
-                    animation: false
-                });
-                scheduleContainers();
+                if (visNetwork && typeof visNetwork.fit === 'function') {
+                    visNetwork.fit({
+                        animation: false,
+                        minZoomLevel: MIN_ZOOM_LEVEL,
+                        maxZoomLevel: MAX_ZOOM_LEVEL
+                    });
+                }
+                clampZoom(visNetwork);
+                scheduleRedraw();
             }, 80);
-        }
-
-        function getNodesDataset() {
-            return typeof nodes !== 'undefined' ? nodes : null;
-        }
-
-        function getEdgesDataset() {
-            return typeof edges !== 'undefined' ? edges : null;
-        }
-
-        function loadEditState() {
-            try {
-                const raw = window.localStorage.getItem(storageKey);
-                if (!raw) return { edits: {}, deleted: {} };
-                const parsed = JSON.parse(raw);
-                return {
-                    edits: parsed.edits || {},
-                    deleted: parsed.deleted || {}
-                };
-            } catch (err) {
-                return { edits: {}, deleted: {} };
-            }
-        }
-
-        function saveEditState(state) {
-            window.localStorage.setItem(storageKey, JSON.stringify(state));
-        }
-
-        function optionMarkup(values, includeBlank) {
-            const options = includeBlank ? [''] : [];
-            (values || []).forEach(value => {
-                if (value && !options.includes(value)) options.push(value);
-            });
-            return options.map(value => `<option value="${escapeHtml(value)}">${escapeHtml(value || '')}</option>`).join('');
-        }
-
-        function escapeHtml(value) {
-            return String(value || '')
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;')
-                .replace(/'/g, '&#039;');
-        }
-
-        function subsetorKey(setor, subsetor) {
-            return `${setor || ''}||${subsetor || ''}`;
-        }
-
-        function resolveLeader(setor, subsetor) {
-            const subsetorLeader = subsetor ? editorData.lideresSubsetor?.[subsetorKey(setor, subsetor)] : null;
-            if (subsetorLeader && subsetorLeader.nome) return subsetorLeader;
-            return editorData.lideresSetor?.[setor] || { mat: '', nome: '' };
-        }
-
-        function shortText(value, limit) {
-            const text = String(value || '').trim();
-            if (text.length <= limit) return text;
-            return text.slice(0, Math.max(0, limit - 3)).trimEnd() + '...';
-        }
-
-        function buildCollaboratorLabel(details) {
-            let label = `${shortText(details.nome, 24)}\n${shortText(details.cargo, 26)}`;
-            if (details.span && Number(details.span) > 0) {
-                label += `\nSpan: ${details.span}`;
-            }
-            return label;
-        }
-
-        function sortText(value) {
-            return String(value || '').trim().toLocaleLowerCase('pt-BR');
-        }
-
-        function positionRankFromDetails(details) {
-            const posicao = sortText(details?.posicao || '');
-            if (posicao.includes('estrat')) return 0;
-            if (posicao.includes('tat') || posicao.includes('tát')) return 1;
-            if (posicao.includes('operacional')) return 2;
-            return 1;
-        }
-
-        function nodeSortKey(node) {
-            const details = node.collaborator || {};
-            const subsetores = editorData.subsetoresPorSetor?.[details.setor] || [];
-            const subsetorIndex = details.subsetor ? subsetores.indexOf(details.subsetor) : -1;
-            const subsetorGroup = !details.subsetor ? 0 : subsetorIndex >= 0 ? 1 : 2;
-            return [
-                sortText(details.setor),
-                subsetorGroup,
-                subsetorIndex >= 0 ? subsetorIndex : 999999,
-                sortText(details.subsetor),
-                positionRankFromDetails(details),
-                sortText(details.nome),
-                sortText(details.cargo),
-                String(node.id)
-            ];
-        }
-
-        function compareSortKey(a, b) {
-            const ak = Array.isArray(a) ? a : nodeSortKey(a);
-            const bk = Array.isArray(b) ? b : nodeSortKey(b);
-            for (let i = 0; i < Math.max(ak.length, bk.length); i += 1) {
-                if (ak[i] < bk[i]) return -1;
-                if (ak[i] > bk[i]) return 1;
-            }
-            return 0;
-        }
-
-        function realGraphNodes() {
-            const ds = getNodesDataset();
-            if (!ds) return [];
-            return ds.get().filter(node => !String(node.id).startsWith('__bend_') && node.collaborator);
-        }
-
-        function clone(value) {
-            return JSON.parse(JSON.stringify(value));
-        }
-
-        function getNodeDetails(nodeId) {
-            const ds = getNodesDataset();
-            if (!ds) return null;
-            const node = ds.get(nodeId);
-            if (!node || !node.collaborator) return null;
-            return clone(node.collaborator);
-        }
-
-        function applyDetailsToNode(nodeId, details) {
-            const ds = getNodesDataset();
-            if (!ds) return;
-            const node = ds.get(nodeId);
-            if (!node) return;
-            const nextDetails = Object.assign({}, node.collaborator || {}, details || {});
-            const leader = resolveLeader(nextDetails.setor || '', nextDetails.subsetor || '');
-            nextDetails.lider = leader.nome || '';
-            nextDetails.liderMat = leader.mat || '';
-            nextDetails.supersetor = editorData.supersetorPorSetor?.[nextDetails.setor] || nextDetails.supersetor || '';
-            ds.update({
-                id: nodeId,
-                label: buildCollaboratorLabel(nextDetails),
-                title: 'Clique para ver detalhes',
-                collaborator: nextDetails
-            });
-        }
-
-        function layoutChildLevelGap(parent, child, childrenByParent) {
-            const siblings = childrenByParent.get(parent.id) || [];
-            const ranks = new Set(siblings.map(node => positionRankFromDetails(node.collaborator)));
-            if (ranks.has(1) && ranks.has(2) && positionRankFromDetails(child.collaborator) === 2) {
-                return 2;
-            }
-            return 1;
-        }
-
-        function rebuildGraphLayout() {
-            const ds = getNodesDataset();
-            const edgeDs = getEdgesDataset();
-            if (!ds || !edgeDs) return;
-
-            const graphNodes = realGraphNodes();
-            const byId = new Map(graphNodes.map(node => [String(node.id), node]));
-            const childrenByParent = new Map();
-            const parentByChild = new Map();
-
-            graphNodes.forEach(node => {
-                const leaderId = String(node.collaborator?.liderMat || '');
-                if (leaderId && leaderId !== String(node.id) && byId.has(leaderId)) {
-                    parentByChild.set(String(node.id), leaderId);
-                    if (!childrenByParent.has(leaderId)) childrenByParent.set(leaderId, []);
-                    childrenByParent.get(leaderId).push(node);
-                }
-            });
-
-            childrenByParent.forEach(list => list.sort(compareSortKey));
-            graphNodes.forEach(node => {
-                const nodeId = String(node.id);
-                const details = Object.assign({}, node.collaborator || {});
-                details.span = (childrenByParent.get(nodeId) || []).length;
-                ds.update({
-                    id: node.id,
-                    collaborator: details,
-                    label: buildCollaboratorLabel(details),
-                    title: 'Clique para ver detalhes'
-                });
-                node.collaborator = details;
-            });
-            const roots = graphNodes
-                .filter(node => !parentByChild.has(String(node.id)))
-                .sort((a, b) => (String(a.id) === '1979' ? -1 : String(b.id) === '1979' ? 1 : compareSortKey(a, b)));
-
-            const depth = new Map();
-            const queue = roots.map(root => ({ node: root, depth: 0 }));
-            while (queue.length) {
-                const item = queue.shift();
-                const nodeId = String(item.node.id);
-                if (depth.has(nodeId) && depth.get(nodeId) <= item.depth) continue;
-                depth.set(nodeId, item.depth);
-                (childrenByParent.get(nodeId) || []).forEach(child => {
-                    queue.push({ node: child, depth: item.depth + layoutChildLevelGap(item.node, child, childrenByParent) });
-                });
-            }
-
-            let maxDepth = Math.max(0, ...Array.from(depth.values()));
-            graphNodes.sort(compareSortKey).forEach(node => {
-                const nodeId = String(node.id);
-                if (!depth.has(nodeId)) {
-                    maxDepth += 1;
-                    depth.set(nodeId, maxDepth);
-                }
-            });
-
-            const slot = new Map();
-            let cursor = 0;
-            function place(node) {
-                const nodeId = String(node.id);
-                const kids = childrenByParent.get(nodeId) || [];
-                if (!kids.length) {
-                    slot.set(nodeId, cursor);
-                    cursor += 1;
-                    return;
-                }
-                const first = cursor;
-                kids.forEach(place);
-                slot.set(nodeId, (first + (cursor - 1)) / 2);
-            }
-
-            roots.forEach((root, index) => {
-                place(root);
-                if (index < roots.length - 1) cursor += 1.6;
-            });
-            graphNodes.sort(compareSortKey).forEach(node => {
-                const nodeId = String(node.id);
-                if (!slot.has(nodeId)) {
-                    slot.set(nodeId, cursor);
-                    cursor += 1;
-                }
-            });
-
-            const isHorizontal = editorData.direction === 'LR';
-            const levelGap = isHorizontal ? 820 : 340;
-            const siblingGap = isHorizontal ? 220 : 360;
-            const positions = {};
-            graphNodes.forEach(node => {
-                const nodeId = String(node.id);
-                const branchAxis = slot.get(nodeId) * siblingGap;
-                const hierarchyAxis = depth.get(nodeId) * levelGap;
-                positions[nodeId] = isHorizontal
-                    ? { x: hierarchyAxis, y: branchAxis }
-                    : { x: branchAxis, y: hierarchyAxis };
-            });
-
-            ds.get()
-                .filter(node => String(node.id).startsWith('__bend_'))
-                .forEach(node => ds.remove(node.id));
-            const existingEdgeIds = typeof edgeDs.getIds === 'function'
-                ? edgeDs.getIds()
-                : edgeDs.get().map(edge => edge.id);
-            edgeDs.remove(existingEdgeIds);
-
-            graphNodes.forEach(node => {
-                const pos = positions[String(node.id)] || { x: 0, y: 0 };
-                ds.update({ id: node.id, x: pos.x, y: pos.y, fixed: { x: true, y: true }, physics: false });
-            });
-
-            let bendSeq = 0;
-            function childLevelGap(parent, child) {
-                return layoutChildLevelGap(parent, child, childrenByParent);
-            }
-            function childSubsetorKey(node) {
-                const details = node.collaborator || {};
-                return details.subsetor ? `${details.setor || ''}||${details.subsetor}` : '';
-            }
-            function sharesTacticalSubsetorBranch(parent, child) {
-                if (positionRankFromDetails(child.collaborator) !== 2) return false;
-                const childKey = childSubsetorKey(child);
-                if (!childKey) return false;
-                const siblings = childrenByParent.get(String(parent.id)) || [];
-                const ranks = new Set(
-                    siblings
-                        .filter(sibling => childSubsetorKey(sibling) === childKey)
-                        .map(sibling => positionRankFromDetails(sibling.collaborator))
-                );
-                return ranks.has(1) && ranks.has(2);
-            }
-            function branchOffset(parent, child, distance) {
-                const siblings = childrenByParent.get(String(parent.id)) || [];
-                const ranks = new Set(siblings.map(node => positionRankFromDetails(node.collaborator)));
-                if (ranks.has(1) && ranks.has(2)) {
-                    const rank = positionRankFromDetails(child.collaborator);
-                    if (rank === 1) return Math.min(Math.max(90, distance * 0.35), Math.max(90, distance - 80));
-                    if (rank === 2) {
-                        if (sharesTacticalSubsetorBranch(parent, child)) {
-                            const tacticalDistance = distance / Math.max(1, childLevelGap(parent, child));
-                            return Math.min(Math.max(90, tacticalDistance * 0.35), Math.max(90, tacticalDistance - 80));
-                        }
-                        return Math.max(90, distance - Math.min(130, Math.max(90, distance * 0.35)));
-                    }
-                }
-                return Math.max(90, distance * 0.5);
-            }
-
-            childrenByParent.forEach((kids, parentId) => {
-                const parent = byId.get(String(parentId));
-                if (!parent) return;
-                kids.forEach(child => {
-                    const parentPos = positions[String(parent.id)];
-                    const childPos = positions[String(child.id)];
-                    if (!parentPos || !childPos) return;
-
-                    let b1Pos;
-                    let b2Pos;
-                    if (isHorizontal) {
-                        let midX = parentPos.x + branchOffset(parent, child, childPos.x - parentPos.x);
-                        if (midX > childPos.x - 30) midX = (parentPos.x + childPos.x) / 2;
-                        b1Pos = { x: midX, y: parentPos.y };
-                        b2Pos = { x: midX, y: childPos.y };
-                    } else {
-                        let midY = parentPos.y + branchOffset(parent, child, childPos.y - parentPos.y);
-                        if (midY > childPos.y - 20) midY = (parentPos.y + childPos.y) / 2;
-                        b1Pos = { x: parentPos.x, y: midY };
-                        b2Pos = { x: childPos.x, y: midY };
-                    }
-
-                    const b1 = `__bend_live_${bendSeq}_1`;
-                    const b2 = `__bend_live_${bendSeq}_2`;
-                    bendSeq += 1;
-                    const bendStyle = {
-                        size: 0.1,
-                        shape: 'dot',
-                        label: '',
-                        title: '',
-                        font: { size: 1, color: 'rgba(0,0,0,0)' },
-                        color: { background: 'rgba(0,0,0,0)', border: 'rgba(0,0,0,0)' },
-                        borderWidth: 0,
-                        fixed: { x: true, y: true },
-                        physics: false
-                    };
-                    ds.add([
-                        Object.assign({ id: b1, x: b1Pos.x, y: b1Pos.y }, bendStyle),
-                        Object.assign({ id: b2, x: b2Pos.x, y: b2Pos.y }, bendStyle)
-                    ]);
-                    edgeDs.add([
-                        { from: parent.id, to: b1, arrows: '', color: '#7f95b5', width: 2 },
-                        { from: b1, to: b2, arrows: '', color: '#7f95b5', width: 2 },
-                        { from: b2, to: child.id, arrows: 'to', color: '#7f95b5', width: 2 }
-                    ]);
-                });
-            });
-
-            const visNetwork = getVisNetwork();
-            if (visNetwork && typeof visNetwork.redraw === 'function') visNetwork.redraw();
-            setupContainers();
-        }
-
-        function collectNodeAndBends(nodeId) {
-            const edgeDs = getEdgesDataset();
-            const nodesToRemove = new Set([nodeId]);
-            if (!edgeDs) return nodesToRemove;
-            let changed = true;
-            while (changed) {
-                changed = false;
-                edgeDs.get().forEach(edge => {
-                    const from = String(edge.from);
-                    const to = String(edge.to);
-                    if (nodesToRemove.has(from) && to.startsWith('__bend_') && !nodesToRemove.has(to)) {
-                        nodesToRemove.add(to);
-                        changed = true;
-                    }
-                    if (nodesToRemove.has(to) && from.startsWith('__bend_') && !nodesToRemove.has(from)) {
-                        nodesToRemove.add(from);
-                        changed = true;
-                    }
-                });
-            }
-            return nodesToRemove;
-        }
-
-        function removeNodeAndBends(nodeId) {
-            const ds = getNodesDataset();
-            const edgeDs = getEdgesDataset();
-            if (!ds || !edgeDs || !ds.get(nodeId)) return { nodes: [], edges: [] };
-            const nodesToRemove = collectNodeAndBends(nodeId);
-            const removedNodes = ds.get(Array.from(nodesToRemove));
-            const removedEdges = edgeDs.get({ filter: edge => nodesToRemove.has(String(edge.from)) || nodesToRemove.has(String(edge.to)) });
-            edgeDs.remove(removedEdges.map(edge => edge.id));
-            ds.remove(Array.from(nodesToRemove));
-            return { nodes: removedNodes, edges: removedEdges };
-        }
-
-        function applyPersistedState() {
-            const ds = getNodesDataset();
-            const edgeDs = getEdgesDataset();
-            if (!ds || !edgeDs) return;
-            const state = loadEditState();
-            Object.keys(state.edits || {}).forEach(nodeId => {
-                if (ds.get(nodeId)) {
-                    applyDetailsToNode(nodeId, state.edits[nodeId]);
-                }
-            });
-            Object.keys(state.deleted || {}).forEach(nodeId => {
-                if (ds.get(nodeId)) {
-                    removeNodeAndBends(nodeId);
-                }
-            });
-            rebuildGraphLayout();
         }
 
         function modalMarkup() {
             return `
                 <div class="collab-modal" role="dialog" aria-modal="true">
                     <div class="collab-modal-header">
-                        <p class="collab-modal-title">Colaborador</p>
+                        <p class="collab-modal-title">Detalhes do colaborador</p>
                         <button type="button" class="collab-button icon" data-action="close" aria-label="Fechar">x</button>
                     </div>
-                    <div class="collab-modal-body" style="display:none">
-                        <div class="collab-field"><label>Matrícula</label><input data-field="mat" readonly></div>
-                        <div class="collab-field"><label>Nome</label><input data-field="nome"></div>
-                        <div class="collab-field"><label>Cargo</label><input data-field="cargo"></div>
-                        <div class="collab-field"><label>Setor</label><input data-field="setor"></div>
-                        <div class="collab-field"><label>Subsetor</label><input data-field="subsetor"></div>
-                        <div class="collab-field"><label>Líder</label><input data-field="lider"></div>
-                        <div class="collab-field"><label>Posição</label><select data-field="posicao">
-                            <option value="ESTRATÉGICO">ESTRATÉGICO</option>
-                            <option value="TÁTICO">TÁTICO</option>
-                            <option value="OPERACIONAL">OPERACIONAL</option>
-                        </select></div>
-                    </div>
                     <div class="collab-modal-body">
-                        <div class="collab-field"><label>Matricula</label><input data-field="mat" readonly></div>
+                        <div class="collab-field"><label>Matrícula</label><input data-field="mat" readonly></div>
                         <div class="collab-field"><label>Nome</label><input data-field="nome" readonly></div>
-                        <div class="collab-field"><label>Cargo</label><select data-field="cargo">${optionMarkup(editorData.cargos || [], true)}</select></div>
-                        <div class="collab-field"><label>Posicao</label><select data-field="posicao">${optionMarkup(editorData.posicoes || [], true)}</select></div>
-                        <div class="collab-field"><label>Setor</label><select data-field="setor">${optionMarkup(editorData.setores || [], true)}</select></div>
-                        <div class="collab-field"><label>Subsetor</label><select data-field="subsetor"></select></div>
-                        <div class="collab-field full"><label>Lider</label><input data-field="lider" readonly></div>
-                        <div class="collab-modal-message" data-role="message"></div>
+                        <div class="collab-field"><label>Cargo</label><input data-field="cargo" readonly></div>
+                        <div class="collab-field"><label>Setor</label><input data-field="setor" readonly></div>
+                        <div class="collab-field"><label>Subsetor</label><input data-field="subsetor" readonly></div>
+                        <div class="collab-field"><label>Supersetor</label><input data-field="supersetor" readonly></div>
+                        <div class="collab-field"><label>Líder</label><input data-field="lider" readonly></div>
+                        <div class="collab-field"><label>Posição</label><input data-field="posicao" readonly></div>
+                        <div class="collab-field full"><label>Span</label><input data-field="span" readonly></div>
                     </div>
                     <div class="collab-modal-footer">
-                        <button type="button" class="collab-button danger" data-action="delete">Deletar</button>
-                        <button type="button" class="collab-button" data-action="close">Cancelar</button>
-                        <button type="button" class="collab-button primary" data-action="save">Salvar</button>
+                        <button type="button" class="collab-button" data-action="close">Fechar</button>
                     </div>
                 </div>
             `;
         }
 
-        function ensureCollaboratorModal(networkDiv, visNetwork) {
-            if (modalInstalled) return;
+        function ensureDetailsModal(networkDiv, visNetwork) {
+            if (modalInstalled) return true;
+            if (!visNetwork || typeof visNetwork.on !== 'function') return false;
             modalInstalled = true;
-            const ds = getNodesDataset();
-            const edgeDs = getEdgesDataset();
-            if (!ds || !edgeDs) return;
 
             const backdrop = document.createElement('div');
             backdrop.id = 'collab-modal-backdrop';
@@ -1860,353 +1753,81 @@ def render_pyvis(
             networkDiv.appendChild(backdrop);
 
             function field(name) {
-                const matches = Array.from(backdrop.querySelectorAll(`[data-field="${name}"]`));
-                return matches[matches.length - 1] || null;
+                return backdrop.querySelector('[data-field="' + name + '"]');
             }
 
-            function setOpen(open) {
-                backdrop.classList.toggle('is-open', open);
-            }
-
-            function message(text) {
-                const el = backdrop.querySelector('[data-role="message"]');
-                if (el) el.textContent = text || '';
-            }
-
-            function updateSubsetorOptions(selectedValue) {
-                const setor = field('setor')?.value || '';
-                const subsetorEl = field('subsetor');
-                if (!subsetorEl) return;
-                subsetorEl.innerHTML = optionMarkup(editorData.subsetoresPorSetor?.[setor] || [], true);
-                subsetorEl.value = selectedValue && Array.from(subsetorEl.options).some(opt => opt.value === selectedValue)
-                    ? selectedValue
-                    : '';
-            }
-
-            function updateLeader() {
-                const leader = resolveLeader(field('setor')?.value || '', field('subsetor')?.value || '');
-                const leaderEl = field('lider');
-                if (leaderEl) leaderEl.value = leader.nome || '';
-                return leader;
-            }
-
-            function updatePositionFromCargo() {
-                const cargo = field('cargo')?.value || '';
-                const posicao = editorData.posicaoPorCargo?.[cargo] || '';
-                const posicaoEl = field('posicao');
-                if (posicaoEl) posicaoEl.value = posicao;
-            }
-
-            function validateForm() {
-                const required = ['mat', 'nome', 'cargo', 'posicao', 'setor', 'lider'];
-                const missing = required.filter(name => !(field(name)?.value || '').trim());
-                if (missing.length) {
-                    message('Preencha todos os campos obrigatorios antes de salvar.');
-                    return false;
-                }
-                message('');
-                return true;
-            }
-
-            function fillForm(details) {
-                updateSubsetorOptions(details.subsetor || '');
-                ['mat', 'nome', 'cargo', 'setor', 'subsetor', 'lider', 'posicao'].forEach(name => {
-                    const el = field(name);
-                    if (el) el.value = details[name] || '';
-                });
-                updateSubsetorOptions(details.subsetor || '');
-                updateLeader();
-                message('');
-            }
-
-            function collectForm() {
-                const current = getNodeDetails(currentModalId) || {};
-                ['mat', 'nome', 'cargo', 'setor', 'subsetor', 'lider', 'posicao'].forEach(name => {
-                    const el = field(name);
-                    if (el) current[name] = el.value;
-                });
-            const leader = resolveLeader(current.setor || '', current.subsetor || '');
-            current.lider = leader.nome || '';
-            current.liderMat = leader.mat || '';
-            current.supersetor = editorData.supersetorPorSetor?.[current.setor] || current.supersetor || '';
-            return current;
-        }
-
-            function openModal(nodeId) {
-                const details = getNodeDetails(nodeId);
-                if (!details) return;
-                currentModalId = nodeId;
-                fillForm(details);
-                setOpen(true);
+            function openModal(details) {
+                const value = details || {};
+                if (field('mat')) field('mat').value = value.mat || '';
+                if (field('nome')) field('nome').value = value.nome || '';
+                if (field('cargo')) field('cargo').value = value.cargo || '';
+                if (field('setor')) field('setor').value = value.setor || '';
+                if (field('subsetor')) field('subsetor').value = value.subsetor || '';
+                if (field('supersetor')) field('supersetor').value = value.supersetor || '';
+                if (field('lider')) field('lider').value = value.lider || '';
+                if (field('posicao')) field('posicao').value = value.posicao || '';
+                if (field('span')) field('span').value = String(value.span || 0);
+                backdrop.classList.add('is-open');
             }
 
             function closeModal() {
-                setOpen(false);
-                currentModalId = null;
+                backdrop.classList.remove('is-open');
             }
 
-            function saveCurrent() {
-                if (!currentModalId) return;
-                updateLeader();
-                if (!validateForm()) return;
-                const before = getNodeDetails(currentModalId);
-                const after = collectForm();
-                undoStack.push({ type: 'edit', id: currentModalId, before, after });
-                applyDetailsToNode(currentModalId, after);
-                rebuildGraphLayout();
-                const state = loadEditState();
-                state.edits[currentModalId] = after;
-                delete state.deleted[currentModalId];
-                saveEditState(state);
-                closeModal();
-                setupContainers();
-            }
-
-            function deleteCurrent() {
-                if (!currentModalId) return;
-                const nodeId = currentModalId;
-                const node = ds.get(nodeId);
-                if (!node) return;
-                if (!window.confirm('Deletar este colaborador do organograma?')) return;
-
-                const removed = removeNodeAndBends(nodeId);
-                undoStack.push({ type: 'delete', id: nodeId, nodes: clone(removed.nodes), edges: clone(removed.edges) });
-                const state = loadEditState();
-                state.deleted[nodeId] = true;
-                delete state.edits[nodeId];
-                saveEditState(state);
-                closeModal();
-                setupContainers();
-            }
-
-            function undoLastChange() {
-                const item = undoStack.pop();
-                if (!item) return;
-                const state = loadEditState();
-                if (item.type === 'edit') {
-                    applyDetailsToNode(item.id, item.before);
-                    rebuildGraphLayout();
-                    state.edits[item.id] = item.before;
-                    delete state.deleted[item.id];
-                } else if (item.type === 'delete') {
-                    ds.update(item.nodes || []);
-                    edgeDs.update(item.edges);
-                    delete state.deleted[item.id];
-                    const restoredNode = (item.nodes || []).find(node => String(node.id) === String(item.id));
-                    if (restoredNode && restoredNode.collaborator) {
-                        state.edits[item.id] = restoredNode.collaborator;
-                    }
-                    rebuildGraphLayout();
+            backdrop.addEventListener('click', function(event) {
+                if (event.target === backdrop || (event.target && event.target.dataset && event.target.dataset.action === 'close')) {
+                    closeModal();
                 }
-                saveEditState(state);
-                closeModal();
-                setupContainers();
-            }
-
-            backdrop.addEventListener('click', event => {
-                if (event.target === backdrop || event.target.dataset.action === 'close') closeModal();
-                if (event.target.dataset.action === 'save') saveCurrent();
-                if (event.target.dataset.action === 'delete') deleteCurrent();
             });
 
-            const cargoEl = field('cargo');
-            const setorEl = field('setor');
-            const subsetorEl = field('subsetor');
-            const posicaoEl = field('posicao');
-            if (cargoEl) cargoEl.addEventListener('change', () => {
-                updatePositionFromCargo();
-                validateForm();
-            });
-            if (setorEl) setorEl.addEventListener('change', () => {
-                updateSubsetorOptions('');
-                updateLeader();
-                validateForm();
-            });
-            if (subsetorEl) subsetorEl.addEventListener('change', () => {
-                updateLeader();
-                validateForm();
-            });
-            if (posicaoEl) posicaoEl.addEventListener('change', validateForm);
-
-            document.addEventListener('keydown', event => {
-                if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
-                    event.preventDefault();
-                    undoLastChange();
-                }
+            document.addEventListener('keydown', function(event) {
                 if (event.key === 'Escape') closeModal();
             });
 
-            visNetwork.on('click', params => {
+            visNetwork.on('click', function(params) {
                 const nodeId = params.nodes && params.nodes[0] ? String(params.nodes[0]) : '';
                 if (!nodeId || nodeId.startsWith('__bend_')) return;
-                openModal(nodeId);
+                const ds = getNodesDataset();
+                const node = ds && ds.get(nodeId);
+                if (!node || !node.collaborator) return;
+                openModal(node.collaborator);
             });
 
-            applyPersistedState();
-            setupContainers();
-        }
-        
-        function setupContainers() {
-            const visNetwork = getVisNetwork();
-            const networkDiv = document.getElementById('mynetwork') || document.querySelector('canvas')?.parentElement;
-            if (!visNetwork || !networkDiv) return false;
-            
-            // Criar SVG overlay para containers
-            let overlayDiv = document.getElementById('container-overlay');
-            if (!overlayDiv) {
-                overlayDiv = document.createElement('div');
-                overlayDiv.id = 'container-overlay';
-                overlayDiv.className = 'network-container-overlay';
-                networkDiv.style.position = 'relative';
-                networkDiv.appendChild(overlayDiv);
-            }
-            
-            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            const bounds = networkDiv.getBoundingClientRect();
-            const width = Math.max(1, bounds.width || networkDiv.clientWidth || 1);
-            const height = Math.max(1, bounds.height || networkDiv.clientHeight || 1);
-            svg.setAttribute('class', 'container-svg');
-            svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-            svg.setAttribute('width', width);
-            svg.setAttribute('height', height);
-            
-            // Desenhar containers
-            drawContainers(svg, buildCurrentContainerData(), visNetwork);
-            
-            overlayDiv.innerHTML = '';
-            overlayDiv.appendChild(svg);
-            bindNetworkEvents(visNetwork);
-            ensureCollaboratorModal(networkDiv, visNetwork);
-            applyInitialView(visNetwork);
             return true;
         }
-        
-        function drawContainers(svg, data, visNetwork) {
-            if (!data || !visNetwork) return;
-            
-            // Desenhar cada tipo de container
-            ['supersetor', 'setor', 'subsetor'].forEach(type => {
-                if (data[type]) {
-                    Object.entries(data[type]).forEach(([containerName, nodes]) => {
-                        if (nodes && nodes.length > 0) {
-                            drawContainer(svg, type, containerName, nodes, visNetwork);
-                        }
-                    });
-                }
-            });
-        }
-        
-        function nodeDomBox(visNetwork, node) {
-            if (!node || !node.id) return null;
-            const ds = getNodesDataset();
-            if (ds && !ds.get(node.id)) return null;
 
-            try {
-                if (typeof visNetwork.getBoundingBox === 'function') {
-                    const box = visNetwork.getBoundingBox(node.id);
-                    if (
-                        box &&
-                        Number.isFinite(box.left) &&
-                        Number.isFinite(box.right) &&
-                        Number.isFinite(box.top) &&
-                        Number.isFinite(box.bottom)
-                    ) {
-                        const topLeft = visNetwork.canvasToDOM({ x: box.left, y: box.top });
-                        const bottomRight = visNetwork.canvasToDOM({ x: box.right, y: box.bottom });
-                        return {
-                            left: Math.min(topLeft.x, bottomRight.x),
-                            right: Math.max(topLeft.x, bottomRight.x),
-                            top: Math.min(topLeft.y, bottomRight.y),
-                            bottom: Math.max(topLeft.y, bottomRight.y)
-                        };
-                    }
-                }
-            } catch (err) {
-                // Fall through to the coordinate fallback below.
-            }
-
-            if (!Number.isFinite(Number(node.x)) || !Number.isFinite(Number(node.y))) return null;
-            const center = visNetwork.canvasToDOM({ x: Number(node.x), y: Number(node.y) });
-            const scale = typeof visNetwork.getScale === 'function' ? visNetwork.getScale() : 1;
-            const radius = Math.max(18, (Number(node.size) || 22) * Math.max(scale, 0.2) * 1.8);
-            return {
-                left: center.x - radius,
-                right: center.x + radius,
-                top: center.y - radius,
-                bottom: center.y + radius
-            };
+        function setupContainers() {
+            const visNetwork = getVisNetwork();
+            const networkDiv = document.getElementById('mynetwork');
+            if (!visNetwork || !networkDiv) return false;
+            networkDiv.style.position = 'relative';
+            bindNetworkEvents(visNetwork);
+            if (!ensureDetailsModal(networkDiv, visNetwork)) return false;
+            applyInitialView(visNetwork);
+            if (typeof visNetwork.redraw === 'function') visNetwork.redraw();
+            return true;
         }
 
-        function drawContainer(svg, type, name, nodes, visNetwork) {
-            if (!nodes || nodes.length === 0) return;
-            
-            // Calcular bounding box dos nós
-            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-            let visibleNodes = 0;
-            
-            nodes.forEach(node => {
-                const box = nodeDomBox(visNetwork, node);
-                if (!box) return;
-                minX = Math.min(minX, box.left);
-                maxX = Math.max(maxX, box.right);
-                minY = Math.min(minY, box.top);
-                maxY = Math.max(maxY, box.bottom);
-                visibleNodes += 1;
-            });
-            if (!visibleNodes || !Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) {
-                return;
-            }
-            
-            // Adicionar padding
-            const paddingByType = { supersetor: 38, setor: 28, subsetor: 18 };
-            const padding = paddingByType[type] || 20;
-            minX -= padding;
-            maxX += padding;
-            minY -= padding;
-            maxY += padding;
-            
-            // Desenhar retângulo com bordas arredondadas
-            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            rect.setAttribute('x', minX);
-            rect.setAttribute('y', minY);
-            rect.setAttribute('width', maxX - minX);
-            rect.setAttribute('height', maxY - minY);
-            rect.setAttribute('rx', 8);
-            rect.setAttribute('ry', 8);
-            rect.setAttribute('class', `container-rect-${type}`);
-            
-            svg.appendChild(rect);
-            
-            // Adicionar etiqueta no canto superior esquerdo
-            const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            label.setAttribute('x', minX + 10);
-            label.setAttribute('y', minY + 16);
-            label.setAttribute('class', 'container-label');
-            label.textContent = name;
-            
-            svg.appendChild(label);
-        }
-        
-        // Aguardar carregamento do vis.js
-        const waitForNetwork = setInterval(function() {
+        const waitForNetwork = window.setInterval(function() {
             if (setupContainers()) {
-                clearInterval(waitForNetwork);
+                window.clearInterval(waitForNetwork);
             }
         }, 100);
 
-        setTimeout(function() {
-            clearInterval(waitForNetwork);
+        window.setTimeout(function() {
+            window.clearInterval(waitForNetwork);
             setupContainers();
         }, 10000);
     })();
     </script>
     """
     
-    # Inserir os estilos antes da tag de fechamento do head
-    html_content = html_content.replace("</head>", f"{container_styles}</head>")
+    if "</body>" in html_content:
+        html_content = html_content.replace("</body>", f"{container_styles}</body>")
+    else:
+        html_content = html_content.replace("</head>", f"{container_styles}</head>")
     
     st.components.v1.html(html_content, height=height, scrolling=True)
-    html_path.unlink(missing_ok=True)
 
 
 def request_sidebar_open() -> None:
@@ -2568,3 +2189,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
