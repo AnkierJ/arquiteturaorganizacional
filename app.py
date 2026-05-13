@@ -2,6 +2,7 @@
 import json
 import base64
 import html
+import sqlite3
 import statistics
 from collections import defaultdict, deque
 from pathlib import Path
@@ -16,6 +17,12 @@ from pyvis.network import Network
 BRAND_BLUE = "#14315E"
 BRAND_GREEN = "#2FD68B"
 BRAND_WHITE = "#FFFFFF"
+COLLABORATOR_COLUMNS = ["MAT", "NOME", "CARGO", "SUPERSETOR", "SETOR", "SUBSETOR", "LIDER", "POSICAO", "OBSERVACOES"]
+DB_PATH = Path("organograma.db")
+ORG_CHART_COMPONENT = st.components.v1.declare_component(
+    "org_chart_component",
+    path=str((Path(__file__).parent / "components" / "org_chart_component").resolve()),
+)
 
 
 ICON_PATH = Path("assets/logoOrganograma.png")
@@ -145,50 +152,11 @@ st.markdown(
     }
     div[data-testid="stToggle"] label p {
         font-size: 0.85rem;
-        color: #14315E;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
-
-def logo_data_uri(path: Path, mime: str) -> str | None:
-    if not path.exists():
-        return None
-    raw = path.read_bytes()
-    encoded = base64.b64encode(raw).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
-
-
-def render_brand_header() -> None:
-    gentil_uri = logo_data_uri(Path("assets/logoGentil.png"), "image/png")
-    nex_uri = logo_data_uri(Path("assets/logoNEX.svg"), "image/svg+xml")
-
-    gentil_html = (
-        f'<img src="{gentil_uri}" class="brand-logo" alt="Logo Gentil">' if gentil_uri else ""
-    )
-    nex_html = f'<img src="{nex_uri}" class="brand-logo" alt="Logo NEX">' if nex_uri else ""
-
-    st.markdown(
-        f"""
-        <div class="brand-header">
-            <div class="brand-header-left">{gentil_html}</div>
-            <div class="brand-header-center"></div>
-            <div class="brand-header-right">{nex_html}</div>
-        </div>
-        <div class="brand-title-block" style="text-align:center; padding-bottom:0.4rem;">
-            <h1 style="margin:0.35rem 0 0 0; color:#14315E; font-size:6rem !important; line-height:1.05; font-weight:800;">
-                Organograma da Empresa
-            </h1>
-            <p style="margin:0.4rem 0 0 0; color:#14315E; opacity:0.85; font-size:1.25rem; font-weight:600;">
-                Visualizacao baseada no arquivo organograma.csv
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
 
 @st.cache_data
 def load_data(path: str) -> pd.DataFrame:
@@ -202,8 +170,62 @@ def load_data(path: str) -> pd.DataFrame:
 
     for col in expected:
         df[col] = df[col].fillna("").astype(str).str.strip()
-
+    for col in COLLABORATOR_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    df = df[COLLABORATOR_COLUMNS]
     return df.drop_duplicates(subset=["MAT"], keep="first").reset_index(drop=True)
+
+
+def init_collaborator_db(csv_path: str, db_path: Path = DB_PATH) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS colaboradores (
+                MAT TEXT PRIMARY KEY,
+                NOME TEXT NOT NULL,
+                CARGO TEXT,
+                SUPERSETOR TEXT,
+                SETOR TEXT,
+                SUBSETOR TEXT,
+                LIDER TEXT,
+                POSICAO TEXT,
+                OBSERVACOES TEXT DEFAULT '',
+                UPDATED_AT TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        existing_columns = {
+            str(row[1]).upper()
+            for row in conn.execute("PRAGMA table_info(colaboradores)").fetchall()
+        }
+        if "OBSERVACOES" not in existing_columns:
+            conn.execute("ALTER TABLE colaboradores ADD COLUMN OBSERVACOES TEXT DEFAULT ''")
+        if "UPDATED_AT" not in existing_columns:
+            conn.execute("ALTER TABLE colaboradores ADD COLUMN UPDATED_AT TEXT DEFAULT ''")
+        existing_count = conn.execute("SELECT COUNT(*) FROM colaboradores").fetchone()[0]
+        if existing_count == 0:
+            seed = load_data(csv_path)
+            seed.to_sql("colaboradores", conn, if_exists="append", index=False)
+
+
+def load_collaborators_from_db(db_path: Path = DB_PATH) -> pd.DataFrame:
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT MAT, NOME, CARGO, SUPERSETOR, SETOR, SUBSETOR, LIDER, POSICAO, OBSERVACOES
+            FROM colaboradores
+            ORDER BY NOME COLLATE NOCASE, MAT
+            """,
+            conn,
+            dtype=str,
+        )
+    for col in COLLABORATOR_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    return df[COLLABORATOR_COLUMNS].drop_duplicates(subset=["MAT"], keep="last").reset_index(drop=True)
 
 
 @st.cache_data
@@ -590,6 +612,226 @@ def get_person_label(df: pd.DataFrame, mat: str) -> str:
     return nome or mat
 
 
+NIVEL_OPTIONS = ["I", "II", "III", "IV", "V", "VI", "VII"]
+
+
+def split_cargo_nivel_value(cargo: str) -> tuple[str, str]:
+    text = (cargo or "").strip()
+    if " " not in text:
+        return text, ""
+    cargo_base, nivel = text.rsplit(" ", 1)
+    nivel = nivel.strip()
+    if nivel in NIVEL_OPTIONS:
+        return cargo_base.strip(), nivel
+    return text, ""
+
+
+def join_cargo_nivel(cargo: str, nivel: str) -> str:
+    return " ".join([value for value in [str(cargo).strip(), str(nivel).strip()] if value])
+
+
+def cargo_position_map_from_df(df: pd.DataFrame) -> dict[str, str]:
+    if "CARGO" not in df.columns or "POSICAO" not in df.columns:
+        return {}
+    positions_by_cargo: dict[str, set[str]] = defaultdict(set)
+    for _, row in df.iterrows():
+        cargo = str(row.get("CARGO", "")).strip()
+        posicao = str(row.get("POSICAO", "")).strip()
+        if cargo and posicao:
+            positions_by_cargo[cargo].add(posicao)
+    return {
+        cargo: next(iter(values)) if len(values) == 1 else ""
+        for cargo, values in positions_by_cargo.items()
+    }
+
+
+def setor_supersetor_map(supersetores_df: pd.DataFrame) -> dict[str, str]:
+    if supersetores_df is None or supersetores_df.empty:
+        return {}
+    return {
+        str(row.get("SETORFILHO", "")).strip(): str(row.get("SUPERSETOR", "")).strip()
+        for _, row in supersetores_df.iterrows()
+        if str(row.get("SETORFILHO", "")).strip()
+    }
+
+
+def subsetores_by_setor(subsetores_df: pd.DataFrame, df: pd.DataFrame) -> dict[str, list[str]]:
+    mapping: dict[str, set[str]] = defaultdict(set)
+    if subsetores_df is not None and not subsetores_df.empty:
+        for _, row in subsetores_df.iterrows():
+            setor = str(row.get("SETORPAI", "")).strip()
+            subsetor = str(row.get("SUBSETOR", "")).strip()
+            if setor and subsetor:
+                mapping[setor].add(subsetor)
+    if "SETOR" in df.columns and "SUBSETOR" in df.columns:
+        for _, row in df.iterrows():
+            setor = str(row.get("SETOR", "")).strip()
+            subsetor = str(row.get("SUBSETOR", "")).strip()
+            if setor and subsetor:
+                mapping[setor].add(subsetor)
+    return {setor: sorted(values, key=str.casefold) for setor, values in mapping.items()}
+
+
+def load_crud_changes_from_query() -> dict:
+    raw = st.query_params.get("org_changes", "")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else ""
+    if not raw:
+        return {"upserts": {}, "deletes": []}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {"upserts": {}, "deletes": []}
+    return {
+        "upserts": parsed.get("upserts", {}) if isinstance(parsed.get("upserts", {}), dict) else {},
+        "deletes": parsed.get("deletes", []) if isinstance(parsed.get("deletes", []), list) else [],
+    }
+
+
+def normalize_collaborator_payload(details: dict) -> dict:
+    rename_map = {
+        "mat": "MAT",
+        "nome": "NOME",
+        "cargo": "CARGO",
+        "supersetor": "SUPERSETOR",
+        "setor": "SETOR",
+        "subsetor": "SUBSETOR",
+        "liderMat": "LIDER",
+        "posicao": "POSICAO",
+        "observacoes": "OBSERVACOES",
+    }
+    row = {col: "" for col in COLLABORATOR_COLUMNS}
+    for source_key, target_col in rename_map.items():
+        row[target_col] = str(details.get(source_key, "")).strip()
+    return row
+
+
+def validate_collaborator_row(row: dict, valid_ids: set[str], allow_existing: bool = True) -> str:
+    mat = str(row.get("MAT", "")).strip()
+    if not mat:
+        return "MAT e obrigatorio."
+    if not str(row.get("NOME", "")).strip():
+        return "Nome e obrigatorio."
+    if not str(row.get("CARGO", "")).strip():
+        return "Cargo e obrigatorio."
+    if not str(row.get("POSICAO", "")).strip():
+        return "Posicao e obrigatoria."
+    lider = str(row.get("LIDER", "")).strip()
+    if lider and lider == mat:
+        return "O lider nao pode ser o proprio colaborador."
+    if lider and lider not in valid_ids:
+        return "O lider informado nao existe na tabela de colaboradores."
+    if not allow_existing and mat in valid_ids:
+        return "Ja existe um colaborador com essa MAT."
+    return ""
+
+
+def persist_crud_changes_to_db(changes: dict, db_path: Path = DB_PATH) -> list[str]:
+    errors: list[str] = []
+    with sqlite3.connect(db_path) as conn:
+        existing_ids = {
+            str(row[0]).strip()
+            for row in conn.execute("SELECT MAT FROM colaboradores").fetchall()
+            if str(row[0]).strip()
+        }
+
+        delete_ids = {str(value).strip() for value in changes.get("deletes", []) if str(value).strip()}
+        for mat in delete_ids:
+            conn.execute("UPDATE colaboradores SET LIDER = '', UPDATED_AT = CURRENT_TIMESTAMP WHERE LIDER = ?", (mat,))
+            conn.execute("DELETE FROM colaboradores WHERE MAT = ?", (mat,))
+            existing_ids.discard(mat)
+
+        for _, details in (changes.get("upserts", {}) or {}).items():
+            if not isinstance(details, dict):
+                continue
+            row = normalize_collaborator_payload(details)
+            mat = row["MAT"]
+            error = validate_collaborator_row(row, existing_ids | {mat}, allow_existing=True)
+            if error:
+                errors.append(f"{mat or 'sem MAT'}: {error}")
+                continue
+            conn.execute(
+                """
+                INSERT INTO colaboradores (MAT, NOME, CARGO, SUPERSETOR, SETOR, SUBSETOR, LIDER, POSICAO, OBSERVACOES, UPDATED_AT)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(MAT) DO UPDATE SET
+                    NOME = excluded.NOME,
+                    CARGO = excluded.CARGO,
+                    SUPERSETOR = excluded.SUPERSETOR,
+                    SETOR = excluded.SETOR,
+                    SUBSETOR = excluded.SUBSETOR,
+                    LIDER = excluded.LIDER,
+                    POSICAO = excluded.POSICAO,
+                    OBSERVACOES = excluded.OBSERVACOES,
+                    UPDATED_AT = CURRENT_TIMESTAMP
+                """,
+                tuple(row[col] for col in COLLABORATOR_COLUMNS),
+            )
+            existing_ids.add(mat)
+        conn.commit()
+    return errors
+
+
+def consume_crud_query(db_path: Path = DB_PATH) -> None:
+    changes = load_crud_changes_from_query()
+    if not changes.get("upserts") and not changes.get("deletes"):
+        return
+    errors = persist_crud_changes_to_db(changes, db_path=db_path)
+    if errors:
+        st.session_state["crud_errors"] = errors
+    elif "crud_errors" in st.session_state:
+        del st.session_state["crud_errors"]
+    if "org_changes" in st.query_params:
+        del st.query_params["org_changes"]
+    st.rerun()
+
+
+def apply_crud_changes(df: pd.DataFrame, changes: dict) -> pd.DataFrame:
+    result = df.copy()
+    if "OBSERVACOES" not in result.columns:
+        result["OBSERVACOES"] = ""
+
+    delete_ids = {str(value).strip() for value in changes.get("deletes", []) if str(value).strip()}
+    if delete_ids:
+        result = result[~result["MAT"].astype(str).isin(delete_ids)].copy()
+
+    editable_columns = ["MAT", "NOME", "CARGO", "SUPERSETOR", "SETOR", "SUBSETOR", "LIDER", "POSICAO", "OBSERVACOES"]
+    rename_map = {
+        "mat": "MAT",
+        "nome": "NOME",
+        "cargo": "CARGO",
+        "supersetor": "SUPERSETOR",
+        "setor": "SETOR",
+        "subsetor": "SUBSETOR",
+        "liderMat": "LIDER",
+        "posicao": "POSICAO",
+        "observacoes": "OBSERVACOES",
+    }
+
+    for _, details in (changes.get("upserts", {}) or {}).items():
+        if not isinstance(details, dict):
+            continue
+        mat = str(details.get("mat", "")).strip()
+        if not mat or mat in delete_ids:
+            continue
+
+        row_values = {col: "" for col in result.columns}
+        for source_key, target_col in rename_map.items():
+            if target_col in row_values:
+                row_values[target_col] = str(details.get(source_key, "")).strip()
+        row_values["MAT"] = mat
+
+        mask = result["MAT"].astype(str) == mat
+        if mask.any():
+            for col in editable_columns:
+                if col in result.columns and col in row_values:
+                    result.loc[mask, col] = row_values[col]
+        else:
+            result = pd.concat([result, pd.DataFrame([row_values])], ignore_index=True)
+
+    return result.drop_duplicates(subset=["MAT"], keep="last").reset_index(drop=True)
+
+
 def build_pyvis_network(
     work: pd.DataFrame,
     direction: str = "UD",
@@ -672,6 +914,7 @@ def build_pyvis_network(
             "nome": str(row.get("NOME", "")).strip(),
             "cargo": str(row.get("CARGO", "")).strip(),
             "posicao": str(row.get("POSICAO", "")).strip(),
+            "observacoes": str(row.get("OBSERVACOES", "")).strip(),
         }
 
     for _, row in work.iterrows():
@@ -714,22 +957,29 @@ def build_pyvis_network(
             return []
         return sorted({str(value).strip() for value in editor_source[column].tolist() if str(value).strip()})
 
-    def most_common_position(cargo: str) -> str:
-        if "CARGO" not in editor_source.columns or "POSICAO" not in editor_source.columns:
-            return ""
-        matches = [
-            str(value).strip()
-            for value in editor_source.loc[editor_source["CARGO"].astype(str).str.strip() == cargo, "POSICAO"].tolist()
-            if str(value).strip()
-        ]
-        if not matches:
-            return ""
-        return max(sorted(set(matches)), key=matches.count)
+    nivel_options = ["I", "II", "III", "IV", "V", "VI", "VII"]
+
+    def split_cargo_nivel(cargo: str) -> tuple[str, str]:
+        text = (cargo or "").strip()
+        if " " not in text:
+            return text, ""
+        cargo_base, nivel = text.rsplit(" ", 1)
+        nivel = nivel.strip()
+        if nivel in nivel_options:
+            return cargo_base.strip(), nivel
+        return text, ""
 
     sectors_for_editor = unique_sorted("SETOR")
+    if not setores_df.empty and "SETOR" in setores_df.columns:
+        sectors_for_editor = sorted(
+            set(sectors_for_editor)
+            | {str(value).strip() for value in setores_df["SETOR"].tolist() if str(value).strip()},
+            key=sort_text,
+        )
     cargos_for_editor = unique_sorted("CARGO")
+    cargos_base_for_editor = sorted({split_cargo_nivel(cargo)[0] for cargo in cargos_for_editor if split_cargo_nivel(cargo)[0]}, key=sort_text)
     positions_for_editor = unique_sorted("POSICAO")
-    cargo_position_map = {cargo: most_common_position(cargo) for cargo in cargos_for_editor}
+    cargo_position_map = cargo_position_map_from_df(editor_source)
 
     subsetors_by_sector: dict[str, list[str]] = defaultdict(list)
     if not subsetores_df.empty:
@@ -1250,8 +1500,14 @@ def build_pyvis_network(
                 "lider": name_by_id.get(parent_of.get(node_id, ""), ""),
                 "liderMat": parent_of.get(node_id, ""),
                 "posicao": org.get("posicao", ""),
+                "observacoes": org.get("observacoes", ""),
                 "baseLabel": attrs["label"],
                 "span": span,
+            },
+            "containerInfo": {
+                "supersetor": supersetor,
+                "setor": setor,
+                "subsetor": subsetor,
             },
         }
         
@@ -1333,6 +1589,8 @@ def build_pyvis_network(
 
     net.org_editor_data = {
         "cargos": cargos_for_editor,
+        "cargosBase": cargos_base_for_editor,
+        "niveis": nivel_options,
         "posicoes": positions_for_editor,
         "setores": sectors_for_editor,
         "subsetoresPorSetor": subsetors_by_sector,
@@ -1365,6 +1623,7 @@ def render_pyvis(
     containers: dict | None = None,
     height: int = 780,
     initial_scale: float = 0.42,
+    enable_crud: bool = True,
 ) -> None:
     html_content = net.generate_html(notebook=False)
     def json_for_script(value: object) -> str:
@@ -1375,13 +1634,51 @@ def render_pyvis(
             .replace("\u2029", "\\u2029")
         )
 
-    container_json = json_for_script(containers or {})
     editor_json = json_for_script(getattr(net, "org_editor_data", {}))
     initial_scale_json = json.dumps(initial_scale)
+    enable_crud_json = json.dumps(enable_crud)
     
-    # Adicionar CSS e JavaScript customizados para renderizar containers
+    # Adicionar JavaScript para renderizar containers
     container_styles = """
     <style>
+    .org-crud-toolbar {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        z-index: 15;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-family: Arial, sans-serif;
+    }
+    .org-chart-search {
+        width: min(280px, 38vw);
+        border: 1px solid rgba(20, 49, 94, 0.22);
+        border-radius: 6px;
+        padding: 8px 10px;
+        background: #FFFFFF;
+        color: #14315E;
+        font-size: 13px;
+        box-shadow: 0 8px 24px rgba(15, 39, 74, 0.12);
+        outline: none;
+    }
+    .org-chart-search:focus {
+        border-color: rgba(20, 49, 94, 0.55);
+    }
+    .org-crud-button {
+        border: 1px solid rgba(20, 49, 94, 0.22);
+        border-radius: 6px;
+        padding: 8px 12px;
+        background: #FFFFFF;
+        color: #14315E;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 800;
+        box-shadow: 0 8px 24px rgba(15, 39, 74, 0.12);
+    }
+    .org-crud-button:hover {
+        border-color: rgba(20, 49, 94, 0.45);
+    }
     .collab-modal-backdrop {
         position: absolute;
         inset: 0;
@@ -1391,120 +1688,126 @@ def render_pyvis(
         align-items: center;
         justify-content: center;
         pointer-events: auto;
+        font-family: Arial, sans-serif;
     }
-
     .collab-modal-backdrop.is-open {
         display: flex;
     }
-
     .collab-modal {
-        width: min(560px, calc(100% - 32px));
+        width: min(900px, calc(100% - 32px));
+        max-height: calc(100% - 32px);
+        overflow: auto;
         background: #FFFFFF;
         border: 1px solid rgba(20, 49, 94, 0.16);
         border-radius: 8px;
         box-shadow: 0 18px 54px rgba(15, 39, 74, 0.22);
-        font-family: Arial, sans-serif;
         color: #14315E;
     }
-
     .collab-modal-header,
     .collab-modal-footer {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 10px;
-        padding: 14px 16px;
+        padding: 16px 20px;
         border-bottom: 1px solid rgba(20, 49, 94, 0.1);
     }
-
     .collab-modal-footer {
         border-top: 1px solid rgba(20, 49, 94, 0.1);
         border-bottom: 0;
         justify-content: flex-end;
+        flex-wrap: wrap;
     }
-
     .collab-modal-title {
         margin: 0;
-        font-size: 16px;
-        font-weight: 700;
+        font-size: 20px;
+        line-height: 1.2;
+        font-weight: 800;
     }
-
     .collab-modal-body {
         display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 12px;
-        padding: 16px;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px 16px;
+        padding: 18px 20px 20px 20px;
     }
-
     .collab-field.full {
         grid-column: 1 / -1;
     }
-
     .collab-field label {
         display: block;
-        font-size: 11px;
-        font-weight: 700;
-        margin-bottom: 5px;
+        font-size: 12px;
+        font-weight: 800;
+        margin-bottom: 7px;
         text-transform: uppercase;
         color: #53657f;
     }
-
     .collab-field input,
-    .collab-field select {
+    .collab-field select,
+    .collab-field textarea {
         width: 100%;
+        min-width: 0;
         box-sizing: border-box;
         border: 1px solid rgba(20, 49, 94, 0.22);
         border-radius: 6px;
-        padding: 8px 9px;
+        padding: 10px 11px;
         color: #14315E;
         background: #FFFFFF;
-        font-size: 13px;
+        font-size: 14px;
+        font-family: Arial, sans-serif;
     }
-
+    .collab-field textarea {
+        min-height: 76px;
+        resize: vertical;
+    }
     .collab-field input[readonly] {
         background: #F3F6FA;
         color: #53657f;
     }
-
     .collab-modal-message {
         grid-column: 1 / -1;
         min-height: 18px;
         color: #BE123C;
         font-size: 12px;
-        font-weight: 700;
+        font-weight: 800;
     }
-
     .collab-button {
         border: 1px solid rgba(20, 49, 94, 0.22);
         border-radius: 6px;
-        padding: 8px 12px;
+        padding: 9px 14px;
         background: #FFFFFF;
         color: #14315E;
         cursor: pointer;
-        font-weight: 700;
+        font-weight: 800;
     }
-
     .collab-button.primary {
         background: #14315E;
+        border-color: #14315E;
         color: #FFFFFF;
     }
-
     .collab-button.danger {
         border-color: rgba(190, 18, 60, 0.35);
         color: #BE123C;
     }
-
     .collab-button.icon {
         border: 0;
         padding: 4px 6px;
-        font-size: 18px;
+        font-size: 20px;
+        line-height: 1;
+        box-shadow: none;
+    }
+    @media (max-width: 680px) {
+        .collab-modal-body {
+            grid-template-columns: 1fr;
+        }
     }
     </style>
-    
+
     <script>
     (function() {
         const editorData = """ + editor_json + """;
         const initialScale = """ + initial_scale_json + """;
+        const crudEnabled = """ + enable_crud_json + """;
+        const STORAGE_KEY = 'org_chart_crud_changes_v1';
         const MIN_ZOOM_LEVEL = 0.18;
         const MAX_ZOOM_LEVEL = 2.5;
         let eventsBound = false;
@@ -1537,7 +1840,7 @@ def render_pyvis(
         function currentContainers() {
             const data = { supersetor: {}, setor: {}, subsetor: {} };
             realGraphNodes().forEach(node => {
-                const details = node.collaborator || {};
+                const details = node.containerInfo || {};
                 const item = {
                     id: node.id,
                     x: Number(node.x) || 0,
@@ -1570,7 +1873,7 @@ def render_pyvis(
                     }
                 }
             } catch (err) {
-                // Fallback below.
+                // Fallback below
             }
             const radius = Math.max(42, (Number(node.size) || 22) * 1.7);
             const x = Number(node.x) || 0;
@@ -1685,6 +1988,579 @@ def render_pyvis(
             });
         }
 
+        function emptyChanges() {
+            return { upserts: {}, deletes: [] };
+        }
+
+        function loadChanges() {
+            return emptyChanges();
+        }
+
+        function saveChanges(changes) {
+            try {
+                localStorage.removeItem(STORAGE_KEY);
+            } catch (err) {
+                console.log('Could not clear local graph changes:', err);
+            }
+        }
+
+        function syncParentWithChanges(changes) {
+            if (!crudEnabled || !window.parent || window.parent === window) return;
+            try {
+                window.parent.postMessage({
+                    type: 'org_chart_event',
+                    payload: {
+                        nonce: Date.now().toString() + '_' + Math.random().toString(16).slice(2),
+                        changes: changes || emptyChanges()
+                    }
+                }, '*');
+            } catch (err) {
+                console.log('Could not send graph changes to Streamlit component:', err);
+            }
+        }
+
+        function hasMeaningfulChanges(changes) {
+            return Boolean(
+                changes
+                && (
+                    Object.keys(changes.upserts || {}).length > 0
+                    || (Array.isArray(changes.deletes) && changes.deletes.length > 0)
+                )
+            );
+        }
+
+        function syncStoredChangesToParent() {
+            try {
+                localStorage.removeItem(STORAGE_KEY);
+            } catch (err) {
+                console.log('Could not clear old local graph changes:', err);
+            }
+        }
+
+        function sortedUnique(values) {
+            return Array.from(new Set((values || []).map(value => String(value || '').trim()).filter(Boolean)))
+                .sort((a, b) => a.localeCompare(b, 'pt-BR'));
+        }
+
+        function splitCargoNivel(cargo) {
+            const text = String(cargo || '').trim();
+            const niveis = editorData.niveis || ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII'];
+            const lastSpace = text.lastIndexOf(' ');
+            if (lastSpace < 0) return { cargo: text, nivel: '' };
+            const cargoBase = text.slice(0, lastSpace).trim();
+            const nivel = text.slice(lastSpace + 1).trim();
+            if (niveis.includes(nivel)) return { cargo: cargoBase, nivel: nivel };
+            return { cargo: text, nivel: '' };
+        }
+
+        function joinCargoNivel(cargo, nivel) {
+            const cargoBase = String(cargo || '').trim();
+            const nivelText = String(nivel || '').trim();
+            return [cargoBase, nivelText].filter(Boolean).join(' ');
+        }
+
+        function allRealNodes() {
+            return realGraphNodes().sort((a, b) => {
+                const an = ((a.collaborator && a.collaborator.nome) || String(a.id)).toString();
+                const bn = ((b.collaborator && b.collaborator.nome) || String(b.id)).toString();
+                return an.localeCompare(bn, 'pt-BR');
+            });
+        }
+
+        function optionHtml(values, selected) {
+            const selectedText = String(selected || '');
+            const opts = ['<option value=""></option>'];
+            sortedUnique([selectedText].concat(values || [])).forEach(value => {
+                const safe = escapeHtml(value);
+                const isSelected = value === selectedText ? ' selected' : '';
+                opts.push('<option value="' + safe + '"' + isSelected + '>' + safe + '</option>');
+            });
+            return opts.join('');
+        }
+
+        function leaderOptionHtml(selectedMat) {
+            const selectedText = String(selectedMat || '');
+            const opts = ['<option value=""></option>'];
+            allRealNodes().forEach(node => {
+                const collaborator = node.collaborator || {};
+                const mat = String(collaborator.mat || node.id || '');
+                const nome = String(collaborator.nome || mat);
+                const label = nome + ' (MAT: ' + mat + ')';
+                const isSelected = mat === selectedText ? ' selected' : '';
+                opts.push('<option value="' + escapeHtml(mat) + '"' + isSelected + '>' + escapeHtml(label) + '</option>');
+            });
+            return opts.join('');
+        }
+
+        function subsetorOptionsForSetor(setor, selected) {
+            const mapping = editorData.subsetoresPorSetor || {};
+            return optionHtml(mapping[setor] || [], selected);
+        }
+
+        function supersetorForSetor(setor) {
+            const mapping = editorData.supersetorPorSetor || {};
+            return mapping[setor] || '';
+        }
+
+        function leaderForOrg(setor, subsetor) {
+            const subsetorKey = String(setor || '') + '||' + String(subsetor || '');
+            const subsetorLeader = (editorData.lideresSubsetor || {})[subsetorKey];
+            if (subsetorLeader && subsetorLeader.mat) return subsetorLeader;
+            const sectorLeader = (editorData.lideresSetor || {})[setor || ''];
+            if (sectorLeader && sectorLeader.mat) return sectorLeader;
+            return { mat: '', nome: '' };
+        }
+
+        function autoPositionForCargoNivel(cargo, nivel) {
+            const cargoCompleto = joinCargoNivel(cargo, nivel);
+            const mapping = editorData.posicaoPorCargo || {};
+            return mapping[cargoCompleto] || '';
+        }
+
+        function escapeHtml(value) {
+            return String(value || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function shortText(value, limit) {
+            const text = String(value || '').trim();
+            if (text.length <= limit) return text;
+            return text.slice(0, Math.max(0, limit - 3)).trimEnd() + '...';
+        }
+
+        function baseLabel(details) {
+            return shortText(details.nome || 'Sem nome', 24) + '\\n' + shortText(details.cargo || 'Sem cargo', 26);
+        }
+
+        function displayLabel(details) {
+            const span = Number(details.span || 0);
+            const label = baseLabel(details);
+            return span > 0 ? label + '\\nSpan: ' + span : label;
+        }
+
+        function clearLocalSearchHighlight() {
+            const ds = getNodesDataset();
+            if (!ds) return;
+            realGraphNodes().forEach(node => {
+                if (node._searchHighlighted) {
+                    ds.update({
+                        id: node.id,
+                        _searchHighlighted: false,
+                        borderWidth: node._previousBorderWidth || 1,
+                        color: node._previousColor || node.color,
+                        size: node._previousSize || node.size
+                    });
+                }
+            });
+        }
+
+        function focusLocalSearch(visNetwork, text) {
+            const query = String(text || '').trim().toLowerCase();
+            clearLocalSearchHighlight();
+            if (!query) {
+                scheduleRedraw();
+                return;
+            }
+            const match = realGraphNodes().find(node => {
+                const details = node.collaborator || {};
+                return [details.nome, details.cargo, details.mat, details.setor, details.subsetor]
+                    .map(value => String(value || '').toLowerCase())
+                    .some(value => value.includes(query));
+            });
+            if (!match) {
+                scheduleRedraw();
+                return;
+            }
+            const ds = getNodesDataset();
+            if (ds) {
+                ds.update({
+                    id: match.id,
+                    _searchHighlighted: true,
+                    _previousColor: match.color,
+                    _previousBorderWidth: match.borderWidth,
+                    _previousSize: match.size,
+                    color: { background: '#2FD68B', border: '#14315E' },
+                    borderWidth: 4,
+                    size: Math.max(Number(match.size) || 22, 34)
+                });
+            }
+            if (visNetwork && typeof visNetwork.moveTo === 'function') {
+                visNetwork.moveTo({
+                    position: { x: Number(match.x) || 0, y: Number(match.y) || 0 },
+                    scale: Math.max(0.6, Math.min(1.15, visNetwork.getScale ? visNetwork.getScale() : 0.8)),
+                    animation: { duration: 550, easingFunction: 'easeInOutQuad' }
+                });
+            }
+            scheduleRedraw();
+        }
+
+        function cleanupBendNodesAround(nodeId, visNetwork) {
+            const ds = getNodesDataset();
+            if (!ds || !visNetwork || typeof visNetwork.getConnectedNodes !== 'function') return;
+            const toRemove = new Set();
+            const stack = (visNetwork.getConnectedNodes(nodeId) || []).map(String);
+            while (stack.length) {
+                const current = stack.pop();
+                if (!current.startsWith('__bend_') || toRemove.has(current)) continue;
+                toRemove.add(current);
+                (visNetwork.getConnectedNodes(current) || []).map(String).forEach(next => {
+                    if (next.startsWith('__bend_') && !toRemove.has(next)) stack.push(next);
+                });
+            }
+            if (toRemove.size) ds.remove(Array.from(toRemove));
+        }
+
+        function edgeDataset() {
+            if (typeof edges !== 'undefined' && edges) return edges;
+            return window.edges || null;
+        }
+
+        function upsertVisualNode(details, options) {
+            if (options && options.persist) {
+                const nodeId = String(details && details.mat ? details.mat : '');
+                if (!nodeId) return;
+                const changes = emptyChanges();
+                changes.upserts[nodeId] = details;
+                syncParentWithChanges(changes);
+                return;
+            }
+            const ds = getNodesDataset();
+            if (!ds || !details || !details.mat) return;
+            const nodeId = String(details.mat);
+            const existing = ds.get(nodeId);
+            const collaborator = Object.assign({}, existing && existing.collaborator ? existing.collaborator : {}, details);
+            collaborator.baseLabel = baseLabel(collaborator);
+            const payload = {
+                id: nodeId,
+                label: displayLabel(collaborator),
+                title: 'Clique para ver detalhes',
+                collaborator: collaborator
+            };
+            if (existing) {
+                ds.update(payload);
+            } else {
+                const leaderNode = details.liderMat ? ds.get(String(details.liderMat)) : null;
+                const x = leaderNode && Number.isFinite(Number(leaderNode.x)) ? Number(leaderNode.x) + 180 : 0;
+                const y = leaderNode && Number.isFinite(Number(leaderNode.y)) ? Number(leaderNode.y) + 180 : 0;
+                ds.add(Object.assign(payload, {
+                    x: x,
+                    y: y,
+                    fixed: { x: false, y: false },
+                    physics: false,
+                    size: 22,
+                    color: { background: '#b8cbe6', border: '#7f9fc4' },
+                    borderWidth: 1
+                }));
+            }
+
+            const edgeDs = edgeDataset();
+            if (edgeDs && details.liderMat && String(details.liderMat) !== nodeId) {
+                const edgeId = 'crud_edge_' + String(details.liderMat) + '_' + nodeId;
+                if (!edgeDs.get(edgeId)) {
+                    edgeDs.add({
+                        id: edgeId,
+                        from: String(details.liderMat),
+                        to: nodeId,
+                        arrows: 'to',
+                        color: '#7f95b5',
+                        width: 2
+                    });
+                }
+            }
+            scheduleRedraw();
+        }
+
+        function deleteVisualNode(nodeId, visNetwork, persist) {
+            if (persist) {
+                const changes = emptyChanges();
+                if (nodeId) changes.deletes.push(String(nodeId));
+                syncParentWithChanges(changes);
+                return;
+            }
+            const ds = getNodesDataset();
+            if (!ds || !nodeId || !ds.get(String(nodeId))) return;
+            cleanupBendNodesAround(String(nodeId), visNetwork);
+            ds.remove(String(nodeId));
+            scheduleRedraw();
+        }
+
+        function applyStoredChanges(visNetwork) {
+            const changes = loadChanges();
+            (changes.deletes || []).forEach(nodeId => deleteVisualNode(String(nodeId), visNetwork, false));
+            Object.keys(changes.upserts || {}).forEach(nodeId => {
+                const details = changes.upserts[nodeId];
+                if (details && !changes.deletes.map(String).includes(String(nodeId))) {
+                    upsertVisualNode(details, { persist: false });
+                }
+            });
+        }
+
+        function modalMarkup() {
+            return `
+                <div class="collab-modal" role="dialog" aria-modal="true">
+                    <div class="collab-modal-header">
+                        <p class="collab-modal-title" data-role="modal-title">Detalhes do colaborador</p>
+                        <button type="button" class="collab-button icon" data-action="cancel" aria-label="Fechar">x</button>
+                    </div>
+                    <div class="collab-modal-body">
+                        <div class="collab-field"><label>MAT</label><input data-field="mat"></div>
+                        <div class="collab-field"><label>Nome</label><input data-field="nome"></div>
+                        <div class="collab-field"><label>Líder</label><select data-field="liderMat"></select></div>
+                        <div class="collab-field"><label>Cargo</label><select data-field="cargo"></select></div>
+                        <div class="collab-field"><label>Nível</label><select data-field="nivel"></select></div>
+                        <div class="collab-field"><label>Posição</label><select data-field="posicao"></select></div>
+                        <div class="collab-field"><label>SuperSetor</label><input data-field="supersetor" readonly></div>
+                        <div class="collab-field"><label>Setor</label><select data-field="setor"></select></div>
+                        <div class="collab-field"><label>Subsetor</label><select data-field="subsetor"></select></div>
+                        <div class="collab-field full"><label>Observações</label><textarea data-field="observacoes"></textarea></div>
+                        <div class="collab-modal-message" data-role="message"></div>
+                    </div>
+                    <div class="collab-modal-footer">
+                        <button type="button" class="collab-button danger" data-action="delete">Deletar</button>
+                        <button type="button" class="collab-button" data-action="cancel">Cancelar</button>
+                        <button type="button" class="collab-button primary" data-action="save">Salvar</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function ensureCrudUi(networkDiv, visNetwork) {
+            if (modalInstalled) return true;
+            if (!visNetwork || typeof visNetwork.on !== 'function') return false;
+            modalInstalled = true;
+
+            const toolbar = document.createElement('div');
+            toolbar.className = 'org-crud-toolbar';
+            toolbar.innerHTML = '<input type="search" class="org-chart-search" data-action="search" placeholder="Buscar no gráfico"><button type="button" class="org-crud-button" data-action="create">+ Novo nó</button>';
+            networkDiv.appendChild(toolbar);
+
+            const backdrop = document.createElement('div');
+            backdrop.id = 'collab-modal-backdrop';
+            backdrop.className = 'collab-modal-backdrop';
+            backdrop.innerHTML = modalMarkup();
+            networkDiv.appendChild(backdrop);
+
+            let currentMode = 'edit';
+            let currentNodeId = '';
+
+            function field(name) {
+                return backdrop.querySelector('[data-field="' + name + '"]');
+            }
+
+            function setMessage(text) {
+                const el = backdrop.querySelector('[data-role="message"]');
+                if (el) el.textContent = text || '';
+            }
+
+            function setInput(name, value) {
+                const el = field(name);
+                if (el) el.value = value == null ? '' : String(value);
+            }
+
+            function getInput(name) {
+                const el = field(name);
+                return el ? String(el.value || '').trim() : '';
+            }
+
+            function setReadOnlyForMode(mode) {
+                const isCreate = mode === 'create';
+                if (field('mat')) field('mat').readOnly = !isCreate;
+                if (field('nome')) field('nome').readOnly = !isCreate;
+                if (field('liderMat')) field('liderMat').disabled = !isCreate;
+                const del = backdrop.querySelector('[data-action="delete"]');
+                if (del) del.style.display = isCreate ? 'none' : '';
+            }
+
+            function refreshSubsetores() {
+                const setor = getInput('setor');
+                const subsetor = getInput('subsetor');
+                if (field('subsetor')) field('subsetor').innerHTML = subsetorOptionsForSetor(setor, subsetor);
+                setInput('supersetor', supersetorForSetor(setor));
+                if (currentMode === 'create') {
+                    const leader = leaderForOrg(setor, getInput('subsetor'));
+                    if (leader.mat) setInput('liderMat', leader.mat);
+                }
+            }
+
+            function refreshPosicaoFromCargoNivel() {
+                setInput('posicao', autoPositionForCargoNivel(getInput('cargo'), getInput('nivel')));
+            }
+
+            function installOptions(details) {
+                const value = details || {};
+                const cargoParts = splitCargoNivel(value.cargo || '');
+                const selectedCargo = value.cargoBase || cargoParts.cargo;
+                const selectedNivel = value.nivel || cargoParts.nivel;
+                if (field('cargo')) field('cargo').innerHTML = optionHtml(editorData.cargosBase || editorData.cargos || [], selectedCargo);
+                if (field('nivel')) field('nivel').innerHTML = optionHtml(editorData.niveis || [], selectedNivel);
+                if (field('setor')) field('setor').innerHTML = optionHtml(editorData.setores || [], value.setor || '');
+                if (field('subsetor')) field('subsetor').innerHTML = subsetorOptionsForSetor(value.setor || '', value.subsetor || '');
+                if (field('posicao')) field('posicao').innerHTML = optionHtml(editorData.posicoes || [], value.posicao || '');
+                if (field('liderMat')) field('liderMat').innerHTML = leaderOptionHtml(value.liderMat || '');
+            }
+
+            function openModal(mode, details) {
+                currentMode = mode;
+                currentNodeId = details && details.mat ? String(details.mat) : '';
+                const value = Object.assign({
+                    mat: '',
+                    nome: '',
+                    cargo: '',
+                    nivel: '',
+                    setor: '',
+                    subsetor: '',
+                    supersetor: '',
+                    liderMat: '',
+                    posicao: '',
+                    observacoes: '',
+                    span: 0
+                }, details || {});
+                const cargoParts = splitCargoNivel(value.cargo || '');
+                const cargoBase = value.cargoBase || cargoParts.cargo;
+                const nivel = value.nivel || cargoParts.nivel;
+
+                const title = backdrop.querySelector('[data-role="modal-title"]');
+                if (title) title.textContent = mode === 'create' ? 'Criar novo nó' : 'Detalhes do colaborador';
+                installOptions(value);
+                setReadOnlyForMode(mode);
+                setInput('mat', value.mat);
+                setInput('nome', value.nome);
+                setInput('cargo', cargoBase);
+                setInput('nivel', nivel);
+                setInput('setor', value.setor);
+                setInput('subsetor', value.subsetor);
+                setInput('supersetor', value.supersetor || supersetorForSetor(value.setor));
+                setInput('liderMat', value.liderMat);
+                setInput('posicao', value.posicao);
+                setInput('observacoes', value.observacoes);
+                setInput('span', value.span || 0);
+                setMessage('');
+                backdrop.classList.add('is-open');
+            }
+
+            function closeModal() {
+                backdrop.classList.remove('is-open');
+                currentMode = 'edit';
+                currentNodeId = '';
+                setMessage('');
+            }
+
+            function collectDetails() {
+                const mat = getInput('mat');
+                const setor = getInput('setor');
+                const subsetor = getInput('subsetor');
+                const cargoBase = getInput('cargo');
+                const nivel = getInput('nivel');
+                const leader = leaderForOrg(setor, subsetor);
+                const existingNode = currentNodeId && getNodesDataset() ? getNodesDataset().get(currentNodeId) : null;
+                const existing = existingNode && existingNode.collaborator ? existingNode.collaborator : {};
+                return Object.assign({}, existing, {
+                    mat: mat,
+                    nome: getInput('nome'),
+                    cargo: joinCargoNivel(cargoBase, nivel),
+                    cargoBase: cargoBase,
+                    nivel: nivel,
+                    setor: setor,
+                    subsetor: subsetor,
+                    supersetor: getInput('supersetor') || supersetorForSetor(setor),
+                    liderMat: currentMode === 'create' ? getInput('liderMat') : (existing.liderMat || leader.mat || ''),
+                    lider: currentMode === 'create' ? '' : (existing.lider || leader.nome || ''),
+                    posicao: getInput('posicao'),
+                    observacoes: getInput('observacoes'),
+                    span: Number(existing.span || 0)
+                });
+            }
+
+            function validateDetails(details) {
+                if (!details.mat) return 'Informe a matrícula.';
+                if (!details.nome) return 'Informe o nome.';
+                if (currentMode === 'create' && getNodesDataset() && getNodesDataset().get(String(details.mat))) {
+                    return 'Já existe um nó com essa matrícula.';
+                }
+                if (currentMode === 'create' && details.liderMat && String(details.liderMat) === String(details.mat)) {
+                    return 'O líder não pode ser o próprio colaborador.';
+                }
+                return '';
+            }
+
+            function saveModal() {
+                const details = collectDetails();
+                const error = validateDetails(details);
+                if (error) {
+                    setMessage(error);
+                    return;
+                }
+                upsertVisualNode(details, { persist: true });
+                closeModal();
+            }
+
+            function deleteModal() {
+                if (!currentNodeId) return;
+                deleteVisualNode(currentNodeId, visNetwork, true);
+                closeModal();
+            }
+
+            toolbar.addEventListener('click', function(event) {
+                const action = event.target && event.target.dataset ? event.target.dataset.action : '';
+                if (action === 'create') {
+                    const firstLeader = allRealNodes()[0];
+                    const leaderMat = firstLeader && firstLeader.collaborator ? firstLeader.collaborator.mat : '';
+                    openModal('create', { liderMat: leaderMat, span: 0 });
+                }
+            });
+            const searchInput = toolbar.querySelector('[data-action="search"]');
+            if (searchInput) {
+                searchInput.addEventListener('keydown', function(event) {
+                    if (event.key === 'Enter') {
+                        event.preventDefault();
+                        focusLocalSearch(visNetwork, searchInput.value);
+                    }
+                });
+                searchInput.addEventListener('input', function() {
+                    window.clearTimeout(searchInput._searchTimer);
+                    searchInput._searchTimer = window.setTimeout(function() {
+                        focusLocalSearch(visNetwork, searchInput.value);
+                    }, 220);
+                });
+            }
+
+            backdrop.addEventListener('click', function(event) {
+                if (event.target === backdrop) closeModal();
+                const action = event.target && event.target.dataset ? event.target.dataset.action : '';
+                if (action === 'cancel') closeModal();
+                if (action === 'save') saveModal();
+                if (action === 'delete') deleteModal();
+            });
+
+            ['setor', 'subsetor'].forEach(name => {
+                const el = field(name);
+                if (el) el.addEventListener('change', refreshSubsetores);
+            });
+            ['cargo', 'nivel'].forEach(name => {
+                const el = field(name);
+                if (el) el.addEventListener('change', refreshPosicaoFromCargoNivel);
+            });
+
+            document.addEventListener('keydown', function(event) {
+                if (event.key === 'Escape' && backdrop.classList.contains('is-open')) closeModal();
+            });
+
+            visNetwork.on('click', function(params) {
+                const nodeId = params.nodes && params.nodes[0] ? String(params.nodes[0]) : '';
+                if (!nodeId || nodeId.startsWith('__bend_')) return;
+                const ds = getNodesDataset();
+                const node = ds && ds.get(nodeId);
+                if (!node || !node.collaborator) return;
+                openModal('edit', node.collaborator);
+            });
+
+            return true;
+        }
+
         function bindNetworkEvents(visNetwork) {
             if (eventsBound || !visNetwork || typeof visNetwork.on !== 'function') return;
             eventsBound = true;
@@ -1716,93 +2592,16 @@ def render_pyvis(
             }, 80);
         }
 
-        function modalMarkup() {
-            return `
-                <div class="collab-modal" role="dialog" aria-modal="true">
-                    <div class="collab-modal-header">
-                        <p class="collab-modal-title">Detalhes do colaborador</p>
-                        <button type="button" class="collab-button icon" data-action="close" aria-label="Fechar">x</button>
-                    </div>
-                    <div class="collab-modal-body">
-                        <div class="collab-field"><label>Matrícula</label><input data-field="mat" readonly></div>
-                        <div class="collab-field"><label>Nome</label><input data-field="nome" readonly></div>
-                        <div class="collab-field"><label>Cargo</label><input data-field="cargo" readonly></div>
-                        <div class="collab-field"><label>Setor</label><input data-field="setor" readonly></div>
-                        <div class="collab-field"><label>Subsetor</label><input data-field="subsetor" readonly></div>
-                        <div class="collab-field"><label>Supersetor</label><input data-field="supersetor" readonly></div>
-                        <div class="collab-field"><label>Líder</label><input data-field="lider" readonly></div>
-                        <div class="collab-field"><label>Posição</label><input data-field="posicao" readonly></div>
-                        <div class="collab-field full"><label>Span</label><input data-field="span" readonly></div>
-                    </div>
-                    <div class="collab-modal-footer">
-                        <button type="button" class="collab-button" data-action="close">Fechar</button>
-                    </div>
-                </div>
-            `;
-        }
-
-        function ensureDetailsModal(networkDiv, visNetwork) {
-            if (modalInstalled) return true;
-            if (!visNetwork || typeof visNetwork.on !== 'function') return false;
-            modalInstalled = true;
-
-            const backdrop = document.createElement('div');
-            backdrop.id = 'collab-modal-backdrop';
-            backdrop.className = 'collab-modal-backdrop';
-            backdrop.innerHTML = modalMarkup();
-            networkDiv.appendChild(backdrop);
-
-            function field(name) {
-                return backdrop.querySelector('[data-field="' + name + '"]');
-            }
-
-            function openModal(details) {
-                const value = details || {};
-                if (field('mat')) field('mat').value = value.mat || '';
-                if (field('nome')) field('nome').value = value.nome || '';
-                if (field('cargo')) field('cargo').value = value.cargo || '';
-                if (field('setor')) field('setor').value = value.setor || '';
-                if (field('subsetor')) field('subsetor').value = value.subsetor || '';
-                if (field('supersetor')) field('supersetor').value = value.supersetor || '';
-                if (field('lider')) field('lider').value = value.lider || '';
-                if (field('posicao')) field('posicao').value = value.posicao || '';
-                if (field('span')) field('span').value = String(value.span || 0);
-                backdrop.classList.add('is-open');
-            }
-
-            function closeModal() {
-                backdrop.classList.remove('is-open');
-            }
-
-            backdrop.addEventListener('click', function(event) {
-                if (event.target === backdrop || (event.target && event.target.dataset && event.target.dataset.action === 'close')) {
-                    closeModal();
-                }
-            });
-
-            document.addEventListener('keydown', function(event) {
-                if (event.key === 'Escape') closeModal();
-            });
-
-            visNetwork.on('click', function(params) {
-                const nodeId = params.nodes && params.nodes[0] ? String(params.nodes[0]) : '';
-                if (!nodeId || nodeId.startsWith('__bend_')) return;
-                const ds = getNodesDataset();
-                const node = ds && ds.get(nodeId);
-                if (!node || !node.collaborator) return;
-                openModal(node.collaborator);
-            });
-
-            return true;
-        }
-
         function setupContainers() {
             const visNetwork = getVisNetwork();
             const networkDiv = document.getElementById('mynetwork');
             if (!visNetwork || !networkDiv) return false;
             networkDiv.style.position = 'relative';
             bindNetworkEvents(visNetwork);
-            if (!ensureDetailsModal(networkDiv, visNetwork)) return false;
+            if (crudEnabled) {
+                if (!ensureCrudUi(networkDiv, visNetwork)) return false;
+                syncStoredChangesToParent();
+            }
             applyInitialView(visNetwork);
             if (typeof visNetwork.redraw === 'function') visNetwork.redraw();
             return true;
@@ -1827,7 +2626,15 @@ def render_pyvis(
     else:
         html_content = html_content.replace("</head>", f"{container_styles}</head>")
     
+    if enable_crud:
+        return ORG_CHART_COMPONENT(
+            html=html_content,
+            height=height,
+            default=None,
+            key=f"org_chart_component_{height}",
+        )
     st.components.v1.html(html_content, height=height, scrolling=True)
+    return None
 
 
 def request_sidebar_open() -> None:
@@ -1877,6 +2684,247 @@ def request_sidebar_open() -> None:
     )
 
 
+def render_brand_header() -> None:
+    logo_path = Path("assets/logoOrganograma.png")
+    logo_html = ""
+    if logo_path.exists():
+        logo_bytes = logo_path.read_bytes()
+        logo_html = (
+            '<img class="brand-logo" '
+            f'src="data:image/png;base64,{base64.b64encode(logo_bytes).decode()}" '
+            'alt="Logo" />'
+        )
+
+    st.markdown(
+        f"""
+        <div class="brand-header">
+            <div class="brand-header-left">{logo_html}</div>
+            <div class="brand-header-center">
+                <div class="brand-title-block">
+                    <h1 class="brand-title">Organograma da Empresa</h1>
+                    <p class="brand-subtitle">Visualizacao baseada no arquivo organograma.csv</p>
+                </div>
+            </div>
+            <div class="brand-header-right">{logo_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_collaborator_editor(
+    df: pd.DataFrame,
+    setores_df: pd.DataFrame,
+    supersetores_df: pd.DataFrame,
+    subsetores_df: pd.DataFrame,
+) -> None:
+    cargo_options = sorted(
+        {split_cargo_nivel_value(str(value))[0] for value in df["CARGO"].tolist() if split_cargo_nivel_value(str(value))[0]},
+        key=str.casefold,
+    )
+    cargo_position_map = cargo_position_map_from_df(df)
+    posicao_options = sorted({str(value).strip() for value in df["POSICAO"].tolist() if str(value).strip()}, key=str.casefold)
+    setor_options = sorted(
+        (
+            {str(value).strip() for value in df.get("SETOR", pd.Series(dtype=str)).tolist() if str(value).strip()}
+            | ({str(value).strip() for value in setores_df["SETOR"].tolist() if str(value).strip()} if not setores_df.empty else set())
+        ),
+        key=str.casefold,
+    )
+    setor_to_supersetor = setor_supersetor_map(supersetores_df)
+    subsetor_map = subsetores_by_setor(subsetores_df, df)
+
+    leader_options = [""] + [
+        f"{str(row.get('NOME', '')).strip()} (MAT: {str(row.get('MAT', '')).strip()})"
+        for _, row in df.sort_values(["NOME", "MAT"]).iterrows()
+        if str(row.get("MAT", "")).strip()
+    ]
+    leader_by_label = {"": ""}
+    for label in leader_options[1:]:
+        leader_by_label[label] = label.rsplit("(MAT: ", 1)[-1].rstrip(")")
+
+    def leader_label_for(mat: str) -> str:
+        mat = str(mat or "").strip()
+        if not mat:
+            return ""
+        person = df[df["MAT"].astype(str) == mat]
+        if person.empty:
+            return ""
+        return f"{str(person.iloc[0].get('NOME', '')).strip()} (MAT: {mat})"
+
+    def option_index(options: list[str], value: str) -> int:
+        value = str(value or "").strip()
+        return options.index(value) if value in options else 0
+
+    @st.dialog("Detalhes do colaborador")
+    def collaborator_dialog() -> None:
+        mode = st.session_state.get("collab_dialog_mode", "create")
+        mat = str(st.session_state.get("collab_dialog_mat", "")).strip()
+        existing = {}
+        if mode == "edit" and mat:
+            matches = df[df["MAT"].astype(str) == mat]
+            if not matches.empty:
+                existing = matches.iloc[0].to_dict()
+
+        cargo_base, nivel = split_cargo_nivel_value(str(existing.get("CARGO", "")))
+        selected_setor_key = f"collab_setor_{mode}_{mat or 'new'}"
+        current_setor = str(st.session_state.get(selected_setor_key, existing.get("SETOR", ""))).strip()
+        subsetor_options = [""] + subsetor_map.get(current_setor, [])
+        current_supersetor = setor_to_supersetor.get(current_setor, str(existing.get("SUPERSETOR", "")).strip())
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            input_mat = st.text_input("MAT", value=str(existing.get("MAT", "")), disabled=(mode == "edit"), key=f"collab_mat_{mode}_{mat or 'new'}")
+        with col2:
+            input_nome = st.text_input("Nome", value=str(existing.get("NOME", "")), key=f"collab_nome_{mode}_{mat or 'new'}")
+        with col3:
+            current_leader_label = leader_label_for(str(existing.get("LIDER", "")))
+            input_lider_label = st.selectbox(
+                "Lider",
+                options=leader_options,
+                index=option_index(leader_options, current_leader_label),
+                key=f"collab_lider_{mode}_{mat or 'new'}",
+            )
+
+        col4, col5, col6 = st.columns(3)
+        cargo_key = f"collab_cargo_{mode}_{mat or 'new'}"
+        nivel_key = f"collab_nivel_{mode}_{mat or 'new'}"
+        posicao_key = f"collab_posicao_{mode}_{mat or 'new'}"
+        cargo_combo_state_key = f"collab_cargo_combo_{mode}_{mat or 'new'}"
+        with col4:
+            input_cargo_base = st.selectbox(
+                "Cargo",
+                options=[""] + cargo_options,
+                index=option_index([""] + cargo_options, cargo_base),
+                key=cargo_key,
+            )
+        with col5:
+            input_nivel = st.selectbox(
+                "Nivel",
+                options=[""] + NIVEL_OPTIONS,
+                index=option_index([""] + NIVEL_OPTIONS, nivel),
+                key=nivel_key,
+            )
+
+        cargo_combo = join_cargo_nivel(input_cargo_base, input_nivel)
+        if cargo_combo_state_key not in st.session_state:
+            st.session_state[cargo_combo_state_key] = cargo_combo
+        elif st.session_state.get(cargo_combo_state_key) != cargo_combo:
+            st.session_state[cargo_combo_state_key] = cargo_combo
+            st.session_state[posicao_key] = cargo_position_map.get(cargo_combo, "")
+
+        with col6:
+            input_posicao = st.selectbox(
+                "Posicao",
+                options=[""] + posicao_options,
+                index=option_index([""] + posicao_options, str(existing.get("POSICAO", ""))),
+                key=posicao_key,
+            )
+
+        col7, col8, col9 = st.columns(3)
+        with col7:
+            st.text_input("SuperSetor", value=current_supersetor, disabled=True, key=f"collab_supersetor_{mode}_{mat or 'new'}")
+        with col8:
+            input_setor = st.selectbox(
+                "Setor",
+                options=[""] + setor_options,
+                index=option_index([""] + setor_options, str(existing.get("SETOR", ""))),
+                key=selected_setor_key,
+            )
+        with col9:
+            if str(existing.get("SUBSETOR", "")).strip() and str(existing.get("SUBSETOR", "")).strip() not in subsetor_options:
+                subsetor_options.append(str(existing.get("SUBSETOR", "")).strip())
+            input_subsetor = st.selectbox(
+                "Subsetor",
+                options=subsetor_options,
+                index=option_index(subsetor_options, str(existing.get("SUBSETOR", ""))),
+                key=f"collab_subsetor_{mode}_{mat or 'new'}",
+            )
+
+        input_observacoes = st.text_area(
+            "Observacoes",
+            value=str(existing.get("OBSERVACOES", "")),
+            key=f"collab_obs_{mode}_{mat or 'new'}",
+        )
+
+        action_cols = st.columns([1, 1, 1, 3])
+        with action_cols[0]:
+            save_clicked = st.button("Salvar", type="primary", use_container_width=True)
+        with action_cols[1]:
+            cancel_clicked = st.button("Cancelar", use_container_width=True)
+        with action_cols[2]:
+            delete_clicked = mode == "edit" and st.button("Deletar", use_container_width=True)
+
+        if cancel_clicked:
+            st.session_state["collab_dialog_open"] = False
+            st.rerun()
+
+        if delete_clicked:
+            errors = persist_crud_changes_to_db({"upserts": {}, "deletes": [mat]})
+            if errors:
+                st.error(" | ".join(errors))
+            else:
+                st.session_state["collab_dialog_open"] = False
+                st.rerun()
+
+        if save_clicked:
+            final_mat = mat if mode == "edit" else str(input_mat).strip()
+            payload = {
+                "mat": final_mat,
+                "nome": str(input_nome).strip(),
+                "cargo": join_cargo_nivel(input_cargo_base, input_nivel),
+                "supersetor": setor_to_supersetor.get(str(input_setor).strip(), current_supersetor),
+                "setor": str(input_setor).strip(),
+                "subsetor": str(input_subsetor).strip(),
+                "liderMat": leader_by_label.get(input_lider_label, ""),
+                "posicao": str(input_posicao).strip(),
+                "observacoes": str(input_observacoes).strip(),
+            }
+            valid_ids = set(df["MAT"].astype(str).tolist())
+            validation_error = validate_collaborator_row(
+                normalize_collaborator_payload(payload),
+                valid_ids | ({final_mat} if final_mat else set()),
+                allow_existing=(mode == "edit"),
+            )
+            if mode == "create" and final_mat in valid_ids:
+                validation_error = "Ja existe um colaborador com essa MAT."
+            if validation_error:
+                st.error(validation_error)
+            else:
+                errors = persist_crud_changes_to_db({"upserts": {final_mat: payload}, "deletes": []})
+                if errors:
+                    st.error(" | ".join(errors))
+                else:
+                    st.session_state["collab_dialog_open"] = False
+                    st.rerun()
+
+    with st.container(border=True):
+        st.markdown('<p class="filter-card-title">CRUD de colaboradores</p>', unsafe_allow_html=True)
+        crud_col1, crud_col2, crud_col3 = st.columns([1, 2.4, 1])
+        with crud_col1:
+            if st.button("Criar colaborador", use_container_width=True):
+                st.session_state["collab_dialog_mode"] = "create"
+                st.session_state["collab_dialog_mat"] = ""
+                st.session_state["collab_dialog_open"] = True
+                st.rerun()
+        with crud_col2:
+            editable_labels = [
+                f"{str(row.get('NOME', '')).strip()} (MAT: {str(row.get('MAT', '')).strip()})"
+                for _, row in df.sort_values(["NOME", "MAT"]).iterrows()
+            ]
+            selected_label = st.selectbox("Colaborador para editar", options=editable_labels, key="collab_selected_label")
+        with crud_col3:
+            if st.button("Editar selecionado", use_container_width=True, disabled=not bool(editable_labels)):
+                selected_mat = selected_label.rsplit("(MAT: ", 1)[-1].rstrip(")")
+                st.session_state["collab_dialog_mode"] = "edit"
+                st.session_state["collab_dialog_mat"] = selected_mat
+                st.session_state["collab_dialog_open"] = True
+                st.rerun()
+
+    if st.session_state.get("collab_dialog_open"):
+        collaborator_dialog()
+
+
 def main():
     render_brand_header()
 
@@ -1886,9 +2934,11 @@ def main():
     subsetores_path = "subsetor.csv"
     
     try:
-        df = load_data(path)
+        init_collaborator_db(path)
+        consume_crud_query()
+        df = load_collaborators_from_db()
     except Exception as exc:
-        st.error(f"Erro ao carregar {path}: {exc}")
+        st.error(f"Erro ao carregar colaboradores: {exc}")
         return
 
     try:
@@ -1918,10 +2968,10 @@ def main():
         st.session_state["selected_setores"] = []
     if "selected_posicoes" not in st.session_state:
         st.session_state["selected_posicoes"] = posicoes
-    if "search_text" not in st.session_state:
-        st.session_state["search_text"] = ""
     if "selected_suggestion_idx" not in st.session_state:
         st.session_state["selected_suggestion_idx"] = 0
+    if st.session_state.get("crud_errors"):
+        st.error("Nao foi possivel salvar uma ou mais alteracoes: " + " | ".join(st.session_state["crud_errors"]))
 
     sidebar_view = str(st.session_state.get("sidebar_view", "none"))
     if sidebar_view in {"ranking", "suggestions"}:
@@ -1933,7 +2983,7 @@ def main():
 
     with st.container(border=True):
         st.markdown('<p class="filter-card-title">Filtros</p>', unsafe_allow_html=True)
-        filter_col1, filter_col2, filter_col3 = st.columns([1.2, 1.25, 1.55])
+        filter_col1, filter_col2 = st.columns([1.2, 1.25])
         with filter_col1:
             selected_setores = st.multiselect(
                 "Setor",
@@ -1950,8 +3000,7 @@ def main():
                 key="selected_posicoes",
                 help="Filtre por nivel/posicao no organograma (aplicado quando Setor nao estiver selecionado).",
             )
-        with filter_col3:
-            search = st.text_input("Buscar por nome, cargo ou MAT", key="search_text")
+        search = ""
 
         if selected_setores and not setores_df.empty:
             sector_ids = get_sector_descendant_ids(df, setores_df, selected_setores)
@@ -2145,7 +3194,7 @@ def main():
                 supersetores_df=supersetores_df,
                 subsetores_df=subsetores_df,
             )
-            render_pyvis(net_current, containers=containers_current, height=520)
+            render_pyvis(net_current, containers=containers_current, height=520, enable_crud=False)
         with right_col:
             st.markdown("**Como ficaria com a sugestao aplicada**")
             net_proposed, containers_proposed = build_pyvis_network(
@@ -2157,7 +3206,7 @@ def main():
                 supersetores_df=supersetores_df,
                 subsetores_df=subsetores_df,
             )
-            render_pyvis(net_proposed, containers=containers_proposed, height=520)
+            render_pyvis(net_proposed, containers=containers_proposed, height=520, enable_crud=False)
 
     st.subheader("Visualizacao")
     net, containers = build_pyvis_network(
@@ -2169,7 +3218,18 @@ def main():
         supersetores_df=supersetores_df,
         subsetores_df=subsetores_df,
     )
-    render_pyvis(net, containers=containers)
+    graph_event = render_pyvis(net, containers=containers, enable_crud=True)
+    if isinstance(graph_event, dict):
+        nonce = str(graph_event.get("nonce", ""))
+        if nonce and nonce != st.session_state.get("last_org_chart_event_nonce"):
+            st.session_state["last_org_chart_event_nonce"] = nonce
+            changes = graph_event.get("changes", {})
+            errors = persist_crud_changes_to_db(changes) if isinstance(changes, dict) else ["Evento invalido do organograma."]
+            if errors:
+                st.session_state["crud_errors"] = errors
+            elif "crud_errors" in st.session_state:
+                del st.session_state["crud_errors"]
+            st.rerun()
 
     st.caption(
         "Dica: use scroll para zoom, arraste o fundo para navegar e arraste nos para reorganizar localmente."
