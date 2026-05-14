@@ -284,6 +284,231 @@ def load_subsetores(path: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["SUBSETOR", "SETORPAI", "LIDERMAT"])
 
 
+def init_hierarchy_db(
+    setores_path: str,
+    supersetores_path: str,
+    subsetores_path: str,
+    db_path: Path = DB_PATH,
+) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hierarchy_setores (
+                SETOR TEXT PRIMARY KEY,
+                LIDERMAT TEXT DEFAULT '',
+                UPDATED_AT TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hierarchy_supersetores (
+                SETORFILHO TEXT PRIMARY KEY,
+                SUPERSETOR TEXT NOT NULL,
+                LIDERMAT TEXT DEFAULT '',
+                UPDATED_AT TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hierarchy_subsetores (
+                SUBSETOR TEXT PRIMARY KEY,
+                SETORPAI TEXT NOT NULL,
+                LIDERMAT TEXT DEFAULT '',
+                UPDATED_AT TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        if conn.execute("SELECT COUNT(*) FROM hierarchy_setores").fetchone()[0] == 0:
+            for _, row in load_setores(setores_path).iterrows():
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO hierarchy_setores (SETOR, LIDERMAT)
+                    VALUES (?, ?)
+                    """,
+                    (str(row.get("SETOR", "")).strip(), str(row.get("LIDERMAT", "")).strip()),
+                )
+
+        if conn.execute("SELECT COUNT(*) FROM hierarchy_supersetores").fetchone()[0] == 0:
+            for _, row in load_supersetores(supersetores_path).iterrows():
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO hierarchy_supersetores (SUPERSETOR, SETORFILHO, LIDERMAT)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        str(row.get("SUPERSETOR", "")).strip(),
+                        str(row.get("SETORFILHO", "")).strip(),
+                        str(row.get("LIDERMAT", "")).strip(),
+                    ),
+                )
+
+        if conn.execute("SELECT COUNT(*) FROM hierarchy_subsetores").fetchone()[0] == 0:
+            for _, row in load_subsetores(subsetores_path).iterrows():
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO hierarchy_subsetores (SUBSETOR, SETORPAI, LIDERMAT)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        str(row.get("SUBSETOR", "")).strip(),
+                        str(row.get("SETORPAI", "")).strip(),
+                        str(row.get("LIDERMAT", "")).strip(),
+                    ),
+                )
+        conn.commit()
+
+
+def load_hierarchy_from_db(
+    db_path: Path = DB_PATH,
+    setores_path: str = "setores.csv",
+    supersetores_path: str = "supersetor.csv",
+    subsetores_path: str = "subsetor.csv",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    with sqlite3.connect(db_path) as conn:
+        setores_df = pd.read_sql_query(
+            """
+            SELECT SETOR, LIDERMAT, rowid AS _ROWID
+            FROM hierarchy_setores
+            WHERE TRIM(SETOR) <> ''
+            ORDER BY rowid
+            """,
+            conn,
+            dtype=str,
+        )
+        supersetores_df = pd.read_sql_query(
+            """
+            SELECT SUPERSETOR, SETORFILHO, LIDERMAT, rowid AS _ROWID
+            FROM hierarchy_supersetores
+            WHERE TRIM(SUPERSETOR) <> '' AND TRIM(SETORFILHO) <> ''
+            ORDER BY rowid
+            """,
+            conn,
+            dtype=str,
+        )
+        subsetores_df = pd.read_sql_query(
+            """
+            SELECT SUBSETOR, SETORPAI, LIDERMAT, rowid AS _ROWID
+            FROM hierarchy_subsetores
+            WHERE TRIM(SUBSETOR) <> '' AND TRIM(SETORPAI) <> ''
+            ORDER BY rowid
+            """,
+            conn,
+            dtype=str,
+        )
+
+    frames = [
+        (setores_df, ["SETOR", "LIDERMAT"]),
+        (supersetores_df, ["SUPERSETOR", "SETORFILHO", "LIDERMAT"]),
+        (subsetores_df, ["SUBSETOR", "SETORPAI", "LIDERMAT"]),
+    ]
+    for frame, columns in frames:
+        for col in columns:
+            if col not in frame.columns:
+                frame[col] = ""
+            frame[col] = frame[col].fillna("").astype(str).str.strip()
+
+    def reference_order(path: str, key_columns: list[str]) -> dict[tuple[str, ...], int]:
+        try:
+            reference = pd.read_csv(path, sep=";", dtype=str, keep_default_na=False)
+            reference.columns = [c.strip().upper() for c in reference.columns]
+        except Exception:
+            return {}
+        order: dict[tuple[str, ...], int] = {}
+        for idx, row in reference.iterrows():
+            key = tuple(str(row.get(col, "")).strip() for col in key_columns)
+            if all(key) and key not in order:
+                order[key] = int(idx)
+        return order
+
+    def sort_with_reference(frame: pd.DataFrame, key_columns: list[str], path: str) -> pd.DataFrame:
+        order = reference_order(path, key_columns)
+        work = frame.copy()
+
+        def order_key(row: pd.Series) -> tuple[int, int, str]:
+            key = tuple(str(row.get(col, "")).strip() for col in key_columns)
+            rowid = int(str(row.get("_ROWID", "0")).strip() or 0)
+            label = " ".join(key).casefold()
+            return (0, order[key], label) if key in order else (1, rowid, label)
+
+        if not work.empty:
+            work["_ORDER_KEY"] = [order_key(row) for _, row in work.iterrows()]
+            work = work.sort_values("_ORDER_KEY").drop(columns=["_ORDER_KEY"])
+        return work.drop(columns=[col for col in ["_ROWID"] if col in work.columns]).reset_index(drop=True)
+
+    setores_df = sort_with_reference(setores_df, ["SETOR"], setores_path)
+    supersetores_df = sort_with_reference(supersetores_df, ["SUPERSETOR", "SETORFILHO"], supersetores_path)
+    subsetores_df = sort_with_reference(subsetores_df, ["SUBSETOR", "SETORPAI"], subsetores_path)
+    return setores_df, supersetores_df, subsetores_df
+
+
+def persist_hierarchy_setores(setores_df: pd.DataFrame, db_path: Path = DB_PATH) -> None:
+    clean = setores_df.copy()
+    for col in ["SETOR", "LIDERMAT"]:
+        if col not in clean.columns:
+            clean[col] = ""
+        clean[col] = clean[col].fillna("").astype(str).str.strip()
+    clean = clean[clean["SETOR"] != ""].drop_duplicates(subset=["SETOR"], keep="last")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM hierarchy_setores")
+        for _, row in clean.iterrows():
+            conn.execute(
+                """
+                INSERT INTO hierarchy_setores (SETOR, LIDERMAT, UPDATED_AT)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                """,
+                (row["SETOR"], row["LIDERMAT"]),
+            )
+        conn.commit()
+
+
+def persist_hierarchy_supersetores(supersetores_df: pd.DataFrame, db_path: Path = DB_PATH) -> None:
+    clean = supersetores_df.copy()
+    for col in ["SUPERSETOR", "SETORFILHO", "LIDERMAT"]:
+        if col not in clean.columns:
+            clean[col] = ""
+        clean[col] = clean[col].fillna("").astype(str).str.strip()
+    clean = clean[(clean["SUPERSETOR"] != "") & (clean["SETORFILHO"] != "")]
+    clean = clean.drop_duplicates(subset=["SETORFILHO"], keep="last")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM hierarchy_supersetores")
+        for _, row in clean.iterrows():
+            conn.execute(
+                """
+                INSERT INTO hierarchy_supersetores (SUPERSETOR, SETORFILHO, LIDERMAT, UPDATED_AT)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (row["SUPERSETOR"], row["SETORFILHO"], row["LIDERMAT"]),
+            )
+        conn.commit()
+
+
+def persist_hierarchy_subsetores(subsetores_df: pd.DataFrame, db_path: Path = DB_PATH) -> None:
+    clean = subsetores_df.copy()
+    for col in ["SUBSETOR", "SETORPAI", "LIDERMAT"]:
+        if col not in clean.columns:
+            clean[col] = ""
+        clean[col] = clean[col].fillna("").astype(str).str.strip()
+    clean = clean[(clean["SUBSETOR"] != "") & (clean["SETORPAI"] != "")]
+    clean = clean.drop_duplicates(subset=["SUBSETOR"], keep="last")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM hierarchy_subsetores")
+        for _, row in clean.iterrows():
+            conn.execute(
+                """
+                INSERT INTO hierarchy_subsetores (SUBSETOR, SETORPAI, LIDERMAT, UPDATED_AT)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (row["SUBSETOR"], row["SETORPAI"], row["LIDERMAT"]),
+            )
+        conn.commit()
+
+
 def get_sector_scope_ids(
     df: pd.DataFrame,
     setores_df: pd.DataFrame,
@@ -856,9 +1081,16 @@ def build_pyvis_network(
     
     # Mapear SETOR -> SUPERSETOR
     setor_to_supersetor: dict[str, str] = {}
+    supersetor_by_leader: dict[str, str] = {}
     if not supersetores_df.empty:
         for _, row in supersetores_df.iterrows():
-            setor_to_supersetor[row["SETORFILHO"]] = row["SUPERSETOR"]
+            supersetor = str(row.get("SUPERSETOR", "")).strip()
+            setor_filho = str(row.get("SETORFILHO", "")).strip()
+            leader_id = str(row.get("LIDERMAT", "")).strip()
+            if setor_filho and supersetor:
+                setor_to_supersetor[setor_filho] = supersetor
+            if leader_id and supersetor and leader_id not in supersetor_by_leader:
+                supersetor_by_leader[leader_id] = supersetor
     
     # Mapear SUBSETOR -> SETOR
     subsetor_to_setor: dict[str, str] = {}
@@ -900,6 +1132,7 @@ def build_pyvis_network(
         return (value or "").strip().casefold()
 
     def resolve_org(row: pd.Series) -> dict[str, str]:
+        mat = str(row.get("MAT", "")).strip()
         setor = str(row.get("SETOR", "")).strip()
         subsetor = str(row.get("SUBSETOR", "")).strip()
         supersetor = str(row.get("SUPERSETOR", "")).strip()
@@ -907,6 +1140,8 @@ def build_pyvis_network(
             setor = subsetor_to_setor[subsetor]
         if not supersetor and setor in setor_to_supersetor:
             supersetor = setor_to_supersetor[setor]
+        if not supersetor and mat in supersetor_by_leader:
+            supersetor = supersetor_by_leader[mat]
         return {
             "supersetor": supersetor,
             "setor": setor,
@@ -1665,6 +1900,46 @@ def render_pyvis(
     .org-chart-search:focus {
         border-color: rgba(20, 49, 94, 0.55);
     }
+    .org-chart-search-group {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+    .org-search-nav {
+        display: none;
+        align-items: center;
+        gap: 6px;
+    }
+    .org-search-nav.is-visible {
+        display: flex;
+    }
+    .org-search-nav-button {
+        width: 34px;
+        height: 34px;
+        border: 1px solid rgba(20, 49, 94, 0.22);
+        border-radius: 6px;
+        background: #FFFFFF;
+        color: #14315E;
+        cursor: pointer;
+        font-size: 18px;
+        font-weight: 800;
+        line-height: 1;
+        box-shadow: 0 8px 24px rgba(15, 39, 74, 0.12);
+    }
+    .org-search-nav-button:hover:not(:disabled) {
+        border-color: rgba(20, 49, 94, 0.45);
+    }
+    .org-search-nav-button:disabled {
+        cursor: default;
+        opacity: 0.42;
+    }
+    .org-search-count {
+        min-width: 44px;
+        color: #14315E;
+        font-size: 12px;
+        font-weight: 800;
+        text-align: center;
+    }
     .org-crud-button {
         border: 1px solid rgba(20, 49, 94, 0.22);
         border-radius: 6px;
@@ -1810,10 +2085,14 @@ def render_pyvis(
         const STORAGE_KEY = 'org_chart_crud_changes_v1';
         const MIN_ZOOM_LEVEL = 0.18;
         const MAX_ZOOM_LEVEL = 2.5;
+        const NODE_LABEL_MAX_CHARS = 26;
+        const NODE_LABEL_CHAR_WIDTH = 7.2;
+        const NODE_LABEL_HORIZONTAL_PADDING = 44;
         let eventsBound = false;
         let initialViewApplied = false;
         let modalInstalled = false;
         let isClampingZoom = false;
+        let localSearchState = { query: '', matches: [], currentIndex: 0 };
 
         function getVisNetwork() {
             if (typeof network !== 'undefined' && network && typeof network.redraw === 'function') return network;
@@ -1845,7 +2124,8 @@ def render_pyvis(
                     id: node.id,
                     x: Number(node.x) || 0,
                     y: Number(node.y) || 0,
-                    size: Number(node.size) || 22
+                    size: Number(node.size) || 22,
+                    label: String(node.label || '')
                 };
                 if (details.supersetor) {
                     if (!data.supersetor[details.supersetor]) data.supersetor[details.supersetor] = [];
@@ -1865,20 +2145,18 @@ def render_pyvis(
 
         function nodeCanvasBox(visNetwork, node) {
             if (!node) return null;
-            try {
-                if (visNetwork && typeof visNetwork.getBoundingBox === 'function') {
-                    const box = visNetwork.getBoundingBox(node.id);
-                    if (box && Number.isFinite(box.left) && Number.isFinite(box.right) && Number.isFinite(box.top) && Number.isFinite(box.bottom)) {
-                        return box;
-                    }
-                }
-            } catch (err) {
-                // Fallback below
-            }
-            const radius = Math.max(42, (Number(node.size) || 22) * 1.7);
+            const lines = String(node.label || '').split('\\n');
+            const labelWidth = (Math.max(
+                NODE_LABEL_MAX_CHARS,
+                ...lines.map(line => line.length)
+            ) * NODE_LABEL_CHAR_WIDTH) + NODE_LABEL_HORIZONTAL_PADDING;
+            const size = Number(node.size) || 22;
+            const halfWidth = Math.max(64, labelWidth / 2, size * 2.0);
+            const topExtent = Math.max(56, size * 2.15);
+            const bottomExtent = Math.max(74, (size * 1.85) + (Math.max(1, lines.length) * 15));
             const x = Number(node.x) || 0;
             const y = Number(node.y) || 0;
-            return { left: x - radius, right: x + radius, top: y - radius, bottom: y + radius };
+            return { left: x - halfWidth, right: x + halfWidth, top: y - topExtent, bottom: y + bottomExtent };
         }
 
         function buildContainerBox(type, name, nodes, visNetwork) {
@@ -1904,11 +2182,14 @@ def render_pyvis(
                 subsetor: { x: 18, top: 18, bottom: 32 }
             }[type] || { x: 24, top: 22, bottom: 38 };
 
+            const labelWidth = String(name || '').length * 8.4 + 30;
+            const left = minX - padding.x;
+            const right = Math.max(maxX + padding.x, left + labelWidth);
             return {
                 type,
                 name,
-                left: minX - padding.x,
-                right: maxX + padding.x,
+                left: left,
+                right: right,
                 top: minY - padding.top,
                 bottom: maxY + padding.bottom
             };
@@ -2158,44 +2439,110 @@ def render_pyvis(
             });
         }
 
-        function focusLocalSearch(visNetwork, text) {
-            const query = String(text || '').trim().toLowerCase();
-            clearLocalSearchHighlight();
-            if (!query) {
-                scheduleRedraw();
-                return;
+        function searchUiElements() {
+            const toolbar = document.querySelector('.org-crud-toolbar');
+            return {
+                toolbar: toolbar,
+                input: toolbar ? toolbar.querySelector('[data-action="search"]') : null,
+                navigation: toolbar ? toolbar.querySelector('[data-role="search-nav"]') : null,
+                previous: toolbar ? toolbar.querySelector('[data-action="search-prev"]') : null,
+                next: toolbar ? toolbar.querySelector('[data-action="search-next"]') : null,
+                count: toolbar ? toolbar.querySelector('[data-role="search-count"]') : null
+            };
+        }
+
+        function updateSearchNavigationUi() {
+            const ui = searchUiElements();
+            const count = localSearchState.matches.length;
+            const hasQuery = Boolean(localSearchState.query);
+            const canNavigate = count > 1;
+            if (ui.navigation) ui.navigation.classList.toggle('is-visible', canNavigate);
+            if (ui.previous) ui.previous.disabled = !canNavigate;
+            if (ui.next) ui.next.disabled = !canNavigate;
+            if (ui.count) {
+                ui.count.textContent = hasQuery ? (count ? ((localSearchState.currentIndex + 1) + '/' + count) : '0/0') : '';
             }
-            const match = realGraphNodes().find(node => {
-                const details = node.collaborator || {};
-                return [details.nome, details.cargo, details.mat, details.setor, details.subsetor]
-                    .map(value => String(value || '').toLowerCase())
-                    .some(value => value.includes(query));
-            });
-            if (!match) {
-                scheduleRedraw();
-                return;
-            }
+        }
+
+        function nodeMatchesSearch(node, query) {
+            const details = node.collaborator || {};
+            return [details.nome, details.cargo, details.mat, details.setor, details.subsetor]
+                .map(value => String(value || '').toLowerCase())
+                .some(value => value.includes(query));
+        }
+
+        function localSearchMatches(query) {
+            if (!query) return [];
+            return allRealNodes().filter(node => nodeMatchesSearch(node, query));
+        }
+
+        function focusSearchMatch(visNetwork, match) {
+            if (!match || !visNetwork || typeof visNetwork.moveTo !== 'function') return;
             const ds = getNodesDataset();
-            if (ds) {
+            const current = ds ? ds.get(match.id) : match;
+            visNetwork.moveTo({
+                position: { x: Number(current && current.x) || Number(match.x) || 0, y: Number(current && current.y) || Number(match.y) || 0 },
+                scale: Math.max(0.6, Math.min(1.15, visNetwork.getScale ? visNetwork.getScale() : 0.8)),
+                animation: { duration: 550, easingFunction: 'easeInOutQuad' }
+            });
+        }
+
+        function applyLocalSearchHighlight(activeId) {
+            const ds = getNodesDataset();
+            if (!ds) return;
+            localSearchState.matches.forEach(match => {
+                const node = ds.get(match.id) || match;
+                const isActive = String(match.id) === String(activeId);
                 ds.update({
                     id: match.id,
                     _searchHighlighted: true,
-                    _previousColor: match.color,
-                    _previousBorderWidth: match.borderWidth,
-                    _previousSize: match.size,
-                    color: { background: '#2FD68B', border: '#14315E' },
-                    borderWidth: 4,
-                    size: Math.max(Number(match.size) || 22, 34)
+                    _previousColor: node._searchHighlighted ? node._previousColor : node.color,
+                    _previousBorderWidth: node._searchHighlighted ? node._previousBorderWidth : node.borderWidth,
+                    _previousSize: node._searchHighlighted ? node._previousSize : node.size,
+                    color: { background: isActive ? '#2FD68B' : '#C7F7DF', border: '#14315E' },
+                    borderWidth: isActive ? 5 : 4,
+                    size: Math.max(Number(node._previousSize || node.size) || 22, isActive ? 36 : 32)
                 });
+            });
+        }
+
+        function focusLocalSearch(visNetwork, text, index) {
+            const query = String(text || '').trim().toLowerCase();
+            clearLocalSearchHighlight();
+            localSearchState = { query: query, matches: [], currentIndex: 0 };
+            if (!query) {
+                updateSearchNavigationUi();
+                scheduleRedraw();
+                return;
             }
-            if (visNetwork && typeof visNetwork.moveTo === 'function') {
-                visNetwork.moveTo({
-                    position: { x: Number(match.x) || 0, y: Number(match.y) || 0 },
-                    scale: Math.max(0.6, Math.min(1.15, visNetwork.getScale ? visNetwork.getScale() : 0.8)),
-                    animation: { duration: 550, easingFunction: 'easeInOutQuad' }
-                });
+            const matches = localSearchMatches(query);
+            if (!matches.length) {
+                updateSearchNavigationUi();
+                scheduleRedraw();
+                return;
             }
+            let currentIndex = Number.isInteger(index) ? index : 0;
+            currentIndex = ((currentIndex % matches.length) + matches.length) % matches.length;
+            localSearchState = { query: query, matches: matches, currentIndex: currentIndex };
+            const activeMatch = matches[currentIndex];
+            applyLocalSearchHighlight(activeMatch.id);
+            focusSearchMatch(visNetwork, activeMatch);
+            updateSearchNavigationUi();
             scheduleRedraw();
+        }
+
+        function navigateLocalSearch(visNetwork, delta) {
+            const ui = searchUiElements();
+            const text = ui.input ? ui.input.value : localSearchState.query;
+            const query = String(text || '').trim().toLowerCase();
+            if (!query) {
+                focusLocalSearch(visNetwork, '');
+                return;
+            }
+            const nextIndex = localSearchState.query === query
+                ? localSearchState.currentIndex + delta
+                : 0;
+            focusLocalSearch(visNetwork, text, nextIndex);
         }
 
         function cleanupBendNodesAround(nodeId, visNetwork) {
@@ -2335,7 +2682,7 @@ def render_pyvis(
 
             const toolbar = document.createElement('div');
             toolbar.className = 'org-crud-toolbar';
-            toolbar.innerHTML = '<input type="search" class="org-chart-search" data-action="search" placeholder="Buscar no gráfico"><button type="button" class="org-crud-button" data-action="create">+ Novo nó</button>';
+            toolbar.innerHTML = '<div class="org-chart-search-group"><div class="org-search-nav" data-role="search-nav"><button type="button" class="org-search-nav-button" data-action="search-prev" title="Resultado anterior" aria-label="Resultado anterior" disabled>&lsaquo;</button><span class="org-search-count" data-role="search-count" aria-live="polite"></span><button type="button" class="org-search-nav-button" data-action="search-next" title="Próximo resultado" aria-label="Próximo resultado" disabled>&rsaquo;</button></div><input type="search" class="org-chart-search" data-action="search" placeholder="Buscar no gráfico"></div><button type="button" class="org-crud-button" data-action="create">+ Novo nó</button>';
             networkDiv.appendChild(toolbar);
 
             const backdrop = document.createElement('div');
@@ -2511,13 +2858,19 @@ def render_pyvis(
                     const leaderMat = firstLeader && firstLeader.collaborator ? firstLeader.collaborator.mat : '';
                     openModal('create', { liderMat: leaderMat, span: 0 });
                 }
+                if (action === 'search-prev') {
+                    navigateLocalSearch(visNetwork, -1);
+                }
+                if (action === 'search-next') {
+                    navigateLocalSearch(visNetwork, 1);
+                }
             });
             const searchInput = toolbar.querySelector('[data-action="search"]');
             if (searchInput) {
                 searchInput.addEventListener('keydown', function(event) {
                     if (event.key === 'Enter') {
                         event.preventDefault();
-                        focusLocalSearch(visNetwork, searchInput.value);
+                        navigateLocalSearch(visNetwork, event.shiftKey ? -1 : 1);
                     }
                 });
                 searchInput.addEventListener('input', function() {
@@ -2925,6 +3278,248 @@ def render_collaborator_editor(
         collaborator_dialog()
 
 
+def build_hierarchy_network(
+    setores_df: pd.DataFrame,
+    supersetores_df: pd.DataFrame,
+    subsetores_df: pd.DataFrame,
+) -> Network:
+    net = Network(
+        height="540px",
+        width="100%",
+        directed=True,
+        notebook=False,
+        cdn_resources="in_line",
+    )
+
+    setor_to_supersetor = setor_supersetor_map(supersetores_df)
+    subsetores_map = subsetores_by_setor(subsetores_df, pd.DataFrame(columns=COLLABORATOR_COLUMNS))
+
+    all_setores = sorted(
+        {
+            str(value).strip()
+            for value in setores_df.get("SETOR", pd.Series(dtype=str)).tolist()
+            if str(value).strip()
+        }
+        | {
+            str(value).strip()
+            for value in supersetores_df.get("SETORFILHO", pd.Series(dtype=str)).tolist()
+            if str(value).strip()
+        }
+        | {
+            str(value).strip()
+            for value in subsetores_df.get("SETORPAI", pd.Series(dtype=str)).tolist()
+            if str(value).strip()
+        },
+        key=str.casefold,
+    )
+
+    supersetor_children: dict[str, list[str]] = defaultdict(list)
+    for setor in all_setores:
+        supersetor = setor_to_supersetor.get(setor, "") or "Nao definido"
+        supersetor_children[supersetor].append(setor)
+
+    supersetor_order = [
+        str(value).strip()
+        for value in supersetores_df.get("SUPERSETOR", pd.Series(dtype=str)).tolist()
+        if str(value).strip()
+    ]
+    supersetores = []
+    for value in supersetor_order + sorted(supersetor_children.keys(), key=str.casefold):
+        if value not in supersetores and value in supersetor_children:
+            supersetores.append(value)
+
+    positions: dict[str, tuple[float, float]] = {}
+    leaf_gap = 230.0
+    sector_gap = 0.45
+    super_gap = 0.75
+    y_levels = {
+        "supersetor": 0.0,
+        "setor": 185.0,
+        "subsetor": 370.0,
+    }
+    cursor = 0.0
+
+    def node_id(kind: str, name: str) -> str:
+        return f"{kind}::{name}"
+
+    for supersetor in supersetores:
+        first_cursor = cursor
+        sectors = sorted(supersetor_children.get(supersetor, []), key=str.casefold)
+        for sector_index, setor in enumerate(sectors):
+            subsetores = sorted(subsetores_map.get(setor, []), key=str.casefold)
+            if subsetores:
+                subsetor_slots = []
+                for subsetor in subsetores:
+                    x = cursor * leaf_gap
+                    positions[node_id("subsetor", f"{setor}||{subsetor}")] = (x, y_levels["subsetor"])
+                    subsetor_slots.append(x)
+                    cursor += 1.0
+                positions[node_id("setor", setor)] = (sum(subsetor_slots) / len(subsetor_slots), y_levels["setor"])
+            else:
+                x = cursor * leaf_gap
+                positions[node_id("setor", setor)] = (x, y_levels["setor"])
+                cursor += 1.0
+            if sector_index < len(sectors) - 1:
+                cursor += sector_gap
+
+        if sectors:
+            sector_positions = [positions[node_id("setor", setor)][0] for setor in sectors]
+            positions[node_id("supersetor", supersetor)] = (sum(sector_positions) / len(sector_positions), y_levels["supersetor"])
+        else:
+            positions[node_id("supersetor", supersetor)] = (first_cursor * leaf_gap, y_levels["supersetor"])
+            cursor += 1.0
+        cursor += super_gap
+
+    if not positions:
+        positions[node_id("supersetor", "Nao definido")] = (0.0, y_levels["supersetor"])
+
+    def add_node(kind: str, name: str) -> str:
+        name = str(name or "").strip()
+        nid = node_id(kind, name)
+        if kind == "subsetor" and "||" in name:
+            display_name = name.split("||", 1)[1]
+        else:
+            display_name = name
+        existing = {str(node.get("id")) for node in net.nodes}
+        if nid in existing:
+            return nid
+        color_by_kind = {
+            "supersetor": {"background": "#14315E", "border": "#0f274a"},
+            "setor": {"background": "#2FD68B", "border": "#1f9d66"},
+            "subsetor": {"background": "#D8E6F8", "border": "#7f9fc4"},
+        }
+        label_prefix = {
+            "supersetor": "SuperSetor",
+            "setor": "Setor",
+            "subsetor": "Subsetor",
+        }.get(kind, kind)
+        x, y = positions.get(nid, (0.0, 0.0))
+        net.add_node(
+            nid,
+            label=f"{label_prefix}\n{display_name}",
+            title=display_name,
+            shape="box",
+            margin=12,
+            color=color_by_kind.get(kind, color_by_kind["subsetor"]),
+            font={"color": "#FFFFFF" if kind == "supersetor" else "#14315E", "size": 16, "face": "Arial"},
+            x=x,
+            y=y,
+            fixed={"x": True, "y": True},
+            physics=False,
+            widthConstraint={"minimum": 150, "maximum": 210},
+        )
+        return nid
+
+    bend_seq = 0
+
+    def add_elbow_edge(parent: str, child: str, *, dashed: bool = False) -> None:
+        nonlocal bend_seq
+        px, py = positions.get(parent, (0.0, 0.0))
+        cx, cy = positions.get(child, (0.0, 0.0))
+        mid_y = (py + cy) / 2.0
+        b1 = f"hierarchy_bend::{bend_seq}::1"
+        b2 = f"hierarchy_bend::{bend_seq}::2"
+        bend_seq += 1
+        bend_style = {
+            "size": 0.1,
+            "shape": "dot",
+            "label": "",
+            "title": "",
+            "font": {"size": 1, "color": "rgba(0,0,0,0)"},
+            "color": {"background": "rgba(0,0,0,0)", "border": "rgba(0,0,0,0)"},
+            "borderWidth": 0,
+            "fixed": {"x": True, "y": True},
+            "physics": False,
+        }
+        net.add_node(b1, x=px, y=mid_y, **bend_style)
+        net.add_node(b2, x=cx, y=mid_y, **bend_style)
+        edge_style = {"color": "#7f95b5", "width": 2, "dashes": dashed}
+        net.add_edge(parent, b1, arrows="", **edge_style)
+        net.add_edge(b1, b2, arrows="", **edge_style)
+        net.add_edge(b2, child, arrows="to", **edge_style)
+
+    for supersetor in supersetores:
+        parent = add_node("supersetor", supersetor)
+        for setor in sorted(supersetor_children.get(supersetor, []), key=str.casefold):
+            child = add_node("setor", setor)
+            add_elbow_edge(parent, child, dashed=(supersetor == "Nao definido"))
+            for subsetor in sorted(subsetores_map.get(setor, []), key=str.casefold):
+                subsetor_key = f"{setor}||{subsetor}"
+                subsetor_node = add_node("subsetor", subsetor_key)
+                add_elbow_edge(child, subsetor_node)
+
+    options = {
+        "layout": {"hierarchical": {"enabled": False}},
+        "physics": {"enabled": False},
+        "edges": {"smooth": {"enabled": False}},
+        "interaction": {"hover": True, "dragView": True, "zoomView": True, "navigationButtons": True},
+    }
+    net.set_options(json.dumps(options))
+    return net
+
+
+def render_hierarchy_manager(
+    df: pd.DataFrame,
+    setores_df: pd.DataFrame,
+    supersetores_df: pd.DataFrame,
+    subsetores_df: pd.DataFrame,
+) -> None:
+    with st.container(border=True):
+        header_col, close_col = st.columns([5, 1])
+        with header_col:
+            st.subheader("Hierarquia de SuperSetores, Setores e Subsetores")
+        with close_col:
+            if st.button("Fechar hierarquia", use_container_width=True):
+                st.session_state["hierarchy_open"] = False
+                st.rerun()
+
+        tree_tab, editor_tab = st.tabs(["Arvore", "Editar relacoes"])
+
+        with tree_tab:
+            net = build_hierarchy_network(setores_df, supersetores_df, subsetores_df)
+            st.components.v1.html(net.generate_html(notebook=False), height=560, scrolling=True)
+
+        with editor_tab:
+            st.markdown("**Setores**")
+            setores_edit = st.data_editor(
+                setores_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="hierarchy_setores_editor",
+                column_order=["SETOR", "LIDERMAT"],
+            )
+            if st.button("Salvar setores", type="primary", key="save_hierarchy_setores"):
+                persist_hierarchy_setores(setores_edit)
+                st.success("Setores salvos.")
+                st.rerun()
+
+            st.markdown("**SuperSetores -> Setores**")
+            supersetores_edit = st.data_editor(
+                supersetores_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="hierarchy_supersetores_editor",
+                column_order=["SUPERSETOR", "SETORFILHO", "LIDERMAT"],
+            )
+            if st.button("Salvar relacoes de SuperSetor", type="primary", key="save_hierarchy_supersetores"):
+                persist_hierarchy_supersetores(supersetores_edit)
+                st.success("Relacoes de SuperSetor salvas.")
+                st.rerun()
+
+            st.markdown("**Setores -> Subsetores**")
+            subsetores_edit = st.data_editor(
+                subsetores_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="hierarchy_subsetores_editor",
+                column_order=["SETORPAI", "SUBSETOR", "LIDERMAT"],
+            )
+            if st.button("Salvar relacoes de Subsetor", type="primary", key="save_hierarchy_subsetores"):
+                persist_hierarchy_subsetores(subsetores_edit)
+                st.success("Relacoes de Subsetor salvas.")
+                st.rerun()
+
+
 def main():
     render_brand_header()
 
@@ -2935,6 +3530,7 @@ def main():
     
     try:
         init_collaborator_db(path)
+        init_hierarchy_db(setores_path, supersetores_path, subsetores_path)
         consume_crud_query()
         df = load_collaborators_from_db()
     except Exception as exc:
@@ -2942,21 +3538,11 @@ def main():
         return
 
     try:
-        setores_df = load_setores(setores_path)
+        setores_df, supersetores_df, subsetores_df = load_hierarchy_from_db()
     except Exception as exc:
-        st.warning(f"Nao foi possivel carregar {setores_path}: {exc}")
+        st.warning(f"Nao foi possivel carregar hierarquia do banco: {exc}")
         setores_df = pd.DataFrame(columns=["SETOR", "LIDERMAT"])
-    
-    try:
-        supersetores_df = load_supersetores(supersetores_path)
-    except Exception as exc:
-        st.warning(f"Nao foi possivel carregar {supersetores_path}: {exc}")
         supersetores_df = pd.DataFrame(columns=["SUPERSETOR", "SETORFILHO", "LIDERMAT"])
-    
-    try:
-        subsetores_df = load_subsetores(subsetores_path)
-    except Exception as exc:
-        st.warning(f"Nao foi possivel carregar {subsetores_path}: {exc}")
         subsetores_df = pd.DataFrame(columns=["SUBSETOR", "SETORPAI", "LIDERMAT"])
 
     posicoes = sorted([p for p in df["POSICAO"].dropna().unique() if p])
@@ -2970,6 +3556,8 @@ def main():
         st.session_state["selected_posicoes"] = posicoes
     if "selected_suggestion_idx" not in st.session_state:
         st.session_state["selected_suggestion_idx"] = 0
+    if "hierarchy_open" not in st.session_state:
+        st.session_state["hierarchy_open"] = False
     if st.session_state.get("crud_errors"):
         st.error("Nao foi possivel salvar uma ou mais alteracoes: " + " | ".join(st.session_state["crud_errors"]))
 
@@ -3018,7 +3606,7 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-    action_col1, action_col2, _ = st.columns([1.35, 1.7, 4.5])
+    action_col1, action_col2, action_col3, _ = st.columns([1.35, 1.7, 1.75, 2.75])
     with action_col1:
         if st.button("Mostrar ranking de span", use_container_width=True):
             st.session_state["sidebar_view"] = "ranking"
@@ -3026,6 +3614,10 @@ def main():
     with action_col2:
         if st.button("Mostrar sugestoes de split/merge", use_container_width=True):
             st.session_state["sidebar_view"] = "suggestions"
+            st.rerun()
+    with action_col3:
+        if st.button("Hierarquia de setores", use_container_width=True):
+            st.session_state["hierarchy_open"] = not bool(st.session_state.get("hierarchy_open"))
             st.rerun()
 
     filtered, edge_count, highlighted_ids = build_graph(
@@ -3138,6 +3730,9 @@ def main():
     c3.metric("Conexoes", f"{edge_count}")
     if search.strip():
         st.caption(f"Busca ativa: {len(highlighted_ids)} destaque(s) no organograma.")
+
+    if st.session_state.get("hierarchy_open"):
+        render_hierarchy_manager(df, setores_df, supersetores_df, subsetores_df)
 
     if filtered.empty:
         st.warning("Nenhum resultado para os filtros selecionados.")
