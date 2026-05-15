@@ -1457,6 +1457,23 @@ def build_pyvis_network(
         node_width = (max(payload.get("size", 22), 30) if payload.get("is_highlighted") else payload.get("size", 22)) * 2.0
         return max(48.0, text_width / 2.0, node_width)
 
+    node_box_reserved_chars = 26
+    node_box_char_width = 7.2
+    node_box_horizontal_padding = 44.0
+
+    def node_canvas_extents(node_id: str) -> tuple[float, float, float]:
+        payload = node_payload.get(node_id, {})
+        label = str(payload.get("label", ""))
+        lines = label.split("\n")
+        line_count = len(lines) + (1 if direct_reports.get(node_id, 0) > 0 else 0)
+        longest_line = max((len(line) for line in lines), default=0)
+        label_width = (max(node_box_reserved_chars, longest_line) * node_box_char_width) + node_box_horizontal_padding
+        size = max(float(payload.get("size", 22) or 22), 30.0 if payload.get("is_highlighted") else 22.0)
+        half_width = max(64.0, label_width / 2.0, size * 2.0)
+        top_extent = max(56.0, size * 2.15)
+        bottom_extent = max(74.0, (size * 1.85) + (max(1, line_count) * 15.0))
+        return half_width, top_extent, bottom_extent
+
     def node_gap_slots(left_id: str, right_id: str, gap_px: float = 22.0) -> float:
         return (node_primary_half_width(left_id) + node_primary_half_width(right_id) + gap_px) / sibling_gap
 
@@ -1594,58 +1611,76 @@ def build_pyvis_network(
     ) -> None:
         if len(groups) < 2:
             return
-        radius_by_node = {node_id: node_primary_half_width(node_id) for node_id in graph.nodes}
+        extents_by_node = {node_id: node_canvas_extents(node_id) for node_id in graph.nodes}
 
         def make_box(name: str, nodes: list[str]) -> dict[str, float | str]:
-            primary_values: list[float] = []
-            secondary_values: list[float] = []
-            radii: list[float] = []
+            primary_min_values: list[float] = []
+            primary_max_values: list[float] = []
+            secondary_min_values: list[float] = []
+            secondary_max_values: list[float] = []
             for node_id in nodes:
                 if node_id not in slot or node_id not in depth:
                     continue
-                primary_values.append(slot[node_id] * sibling_gap)
-                secondary_values.append(depth[node_id] * level_gap)
-                radii.append(radius_by_node.get(node_id, 58.0))
-            if not primary_values or not secondary_values:
+                half_width, top_extent, bottom_extent = extents_by_node.get(node_id, (64.0, 56.0, 74.0))
+                primary = slot[node_id] * sibling_gap
+                secondary = depth[node_id] * level_gap
+                primary_min_values.append(primary - half_width)
+                primary_max_values.append(primary + half_width)
+                secondary_min_values.append(secondary - top_extent)
+                secondary_max_values.append(secondary + bottom_extent)
+            if not primary_min_values or not secondary_min_values:
                 return {}
-            max_radius = max(radii or [58.0])
+            primary_min = min(primary_min_values) - primary_padding
+            primary_max = max(primary_max_values) + primary_padding
+            label_width = (len(str(name or "")) * 8.4) + 30.0
+            if not is_horizontal:
+                primary_max = max(primary_max, primary_min + label_width)
             return {
                 "name": name,
-                "primary_min": min(primary_values) - max_radius - primary_padding,
-                "primary_max": max(primary_values) + max_radius + primary_padding,
-                "secondary_min": min(secondary_values) - max_radius - secondary_padding_before,
-                "secondary_max": max(secondary_values) + max_radius + secondary_padding_after,
+                "primary_min": primary_min,
+                "primary_max": primary_max,
+                "secondary_min": min(secondary_min_values) - secondary_padding_before,
+                "secondary_max": max(secondary_max_values) + secondary_padding_after,
             }
 
-        for _ in range(4):
-            boxes = [box for name, nodes in groups.items() if (box := make_box(name, nodes))]
-            boxes.sort(key=lambda box: ((box["primary_min"] + box["primary_max"]) / 2, sort_text(str(box["name"]))))
+        boxes = [box for name, nodes in groups.items() if (box := make_box(name, nodes))]
+        boxes.sort(key=lambda box: (box["primary_min"], box["primary_max"], sort_text(str(box["name"]))))
+        group_names = [str(box["name"]) for box in boxes]
+
+        for _ in range(3):
+            placed: list[dict[str, float | str]] = []
             moved = False
-            for index in range(1, len(boxes)):
-                previous = boxes[index - 1]
-                current = boxes[index]
-                secondary_overlap = previous["secondary_max"] > current["secondary_min"] and current["secondary_max"] > previous["secondary_min"]
-                if not secondary_overlap:
+            for group_name in group_names:
+                current = make_box(group_name, groups.get(group_name, []))
+                if not current:
                     continue
-                overlap = previous["primary_max"] + gap - current["primary_min"]
-                if overlap <= 0:
-                    continue
-                delta_slots = overlap / sibling_gap
-                for node_id in groups.get(str(current["name"]), []):
-                    slot[node_id] = slot.get(node_id, 0.0) + delta_slots
-                moved = True
+                overlap = 0.0
+                for previous in placed:
+                    secondary_overlap = previous["secondary_max"] > current["secondary_min"] and current["secondary_max"] > previous["secondary_min"]
+                    if not secondary_overlap:
+                        continue
+                    overlap = max(overlap, previous["primary_max"] + gap - current["primary_min"])
+                if overlap > 0:
+                    delta_slots = overlap / sibling_gap
+                    for node_id in groups.get(group_name, []):
+                        slot[node_id] = slot.get(node_id, 0.0) + delta_slots
+                    current["primary_min"] = float(current["primary_min"]) + overlap
+                    current["primary_max"] = float(current["primary_max"]) + overlap
+                    moved = True
+                placed.append(current)
             if not moved:
                 break
 
     compact_subsetor_roots()
     enforce_sibling_text_spacing()
     enforce_level_spacing()
+    fixed_group_gap = 18
     separate_group_slots(
         subsetor_nodes(),
         primary_padding=18,
         secondary_padding_before=18,
         secondary_padding_after=30,
-        gap=18,
+        gap=fixed_group_gap,
     )
     enforce_sibling_text_spacing()
     enforce_level_spacing()
@@ -1654,7 +1689,7 @@ def build_pyvis_network(
         primary_padding=26,
         secondary_padding_before=24,
         secondary_padding_after=42,
-        gap=24,
+        gap=fixed_group_gap,
     )
     enforce_sibling_text_spacing()
     enforce_level_spacing()
@@ -1663,7 +1698,7 @@ def build_pyvis_network(
         primary_padding=30,
         secondary_padding_before=28,
         secondary_padding_after=44,
-        gap=36,
+        gap=fixed_group_gap,
     )
     enforce_sibling_text_spacing()
     enforce_level_spacing()
