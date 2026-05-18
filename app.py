@@ -4,6 +4,7 @@ import base64
 import html
 import sqlite3
 import statistics
+import urllib.parse
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -19,6 +20,14 @@ BRAND_GREEN = "#2FD68B"
 BRAND_WHITE = "#FFFFFF"
 COLLABORATOR_COLUMNS = ["MAT", "NOME", "CARGO", "SUPERSETOR", "SETOR", "SUBSETOR", "LIDER", "POSICAO", "OBSERVACOES"]
 DB_PATH = Path("organograma.db")
+KALK_BO_LOGO_PATH = Path("assets/KALK_BO.png")
+KALK_BO_ICON_PATH = Path("assets/KALK_BO_icon.png")
+KALK_STATUS_COLORS = {
+    "pending": "#C8CED8",
+    "green": "#15a979",
+    "yellow": "#fff32b",
+    "red": "#ff3131",
+}
 ORG_CHART_COMPONENT = st.components.v1.declare_component(
     "org_chart_component",
     path=str((Path(__file__).parent / "components" / "org_chart_component").resolve()),
@@ -47,39 +56,21 @@ st.markdown(
         font-weight: 700;
         margin: 0.35rem 0 0 0;
         text-align: center;
-    }
-    .brand-subtitle {
-        color: #14315E;
-        opacity: 0.85;
-        margin-top: 0.35rem;
-        margin-bottom: 0;
-        text-align: center;
+        padding: 0 !important;
     }
     .brand-header {
         display: flex;
+        flex-direction: column;
         align-items: center;
+        align-content: center;
         justify-content: space-between;
         gap: 1rem;
-        padding: 0.15rem 0 0.5rem 0;
-    }
-    .brand-header-left,
-    .brand-header-right {
-        width: 220px;
-        min-width: 180px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }
-    .brand-header-center {
-        flex: 1;
-        text-align: center;
-    }
-    .brand-title-block {
-        padding-bottom: 0.4rem;
+        padding: 0 0 1.15rem 0;
+        margin-bottom: 0.75rem;
     }
     .brand-logo {
-        max-height: 110px;
-        max-width: 100%;
+        max-height: 80px;
+        max-width: 80px;
         object-fit: contain;
         display: block;
     }
@@ -152,6 +143,227 @@ st.markdown(
     }
     div[data-testid="stToggle"] label p {
         font-size: 0.85rem;
+    }
+    .visualization-header {
+        display: flex;
+        align-items: center;
+        min-height: 2.4rem;
+        text-align: center;
+        align-content: center;
+    }
+    .visualization-header h3 {
+        margin: 0;
+        line-height: 1.2;
+        text-align: center;
+        padding: 0;
+    }
+    div[class*="st-key-horizontal_view"] {
+        display: flex;
+        align-items: center;
+        min-height: 2.4rem;
+    }
+    div[class*="st-key-horizontal_view"] label {
+        margin: 0;
+        display: flex;
+        align-items: center;
+    }
+    div[data-testid="stButton"] button img {
+        width: 28px;
+        height: 28px;
+        object-fit: contain;
+        margin-right: 0.35rem;
+    }
+    div[class*="st-key-open_kalk_bo_button"] button {
+        min-height: 40px !important;
+        height: 40px !important;
+        padding: 0 0.75rem !important;
+        border: 1px solid rgba(49, 51, 63, 0.2) !important;
+        border-radius: 0.5rem !important;
+        background: #ffffff !important;
+        box-shadow: none !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+    }
+    div[class*="st-key-open_kalk_bo_button"] button:hover {
+        border-color: rgba(20, 49, 94, 0.45) !important;
+        background: #ffffff !important;
+        box-shadow: none !important;
+    }
+    div[class*="st-key-open_kalk_bo_button"] button p {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin: 0;
+        line-height: 1.6rem;
+        color: #052966;
+        font-size: 1rem;
+    }
+    div[class*="st-key-open_kalk_bo_button"] button img {
+        height: 32px !important;
+        width: auto !important;
+        max-width: 100% !important;
+        object-fit: contain;
+        margin: 0 0.6rem 0 0.15rem !important;
+        display: block;
+        vertical-align: middle;
+    }
+    .kalk-bo-shell {
+        border: 1px solid rgba(20, 49, 94, 0.16);
+        border-radius: 14px;
+        padding: 1rem;
+        background: #f7f9fd;
+        margin: 0.65rem 0 1rem 0;
+    }
+    .kalk-bo-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        margin-bottom: 1rem;
+        padding: 0.35rem 0 0.6rem 0;
+    }
+    .kalk-bo-title-wrap {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        min-width: 0;
+    }
+    .kalk-bo-logo {
+        width: 86px;
+        height: 68px;
+        object-fit: contain;
+        flex: 0 0 auto;
+        filter: drop-shadow(0 4px 8px rgba(20, 49, 94, 0.16));
+    }
+    .kalk-bo-title {
+        color: #202653;
+        font-size: 2.45rem;
+        font-weight: 900;
+        margin: 0;
+        line-height: 1;
+        letter-spacing: 0;
+    }
+    .kalk-bo-subtitle {
+        color: #14315E;
+        font-size: 1.08rem;
+        font-weight: 700;
+        margin: 0.35rem 0 0 0;
+        line-height: 1.25;
+    }
+    .kalk-bo-list {
+        display: grid;
+        gap: 0.55rem;
+        margin-top: 0.35rem;
+    }
+    .kalk-bo-row {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 0.7rem;
+        border: 2px solid #a9bee7;
+        border-radius: 8px;
+        padding: 0.65rem 0.75rem;
+        background: #ffffff;
+    }
+    .kalk-bo-row.subsetor {
+        background: #edf3fb;
+        margin-left: 1.2rem;
+    }
+    .kalk-bo-dot {
+        width: 18px;
+        height: 18px;
+        border-radius: 999px;
+        display: inline-block;
+        border: 1px solid rgba(20, 49, 94, 0.08);
+    }
+    .kalk-bo-name {
+        color: #052966;
+        font-size: 1.02rem;
+        font-weight: 900;
+        letter-spacing: 0.02em;
+        overflow-wrap: anywhere;
+    }
+    .kalk-bo-meta {
+        color: #53657f;
+        font-size: 0.8rem;
+        font-weight: 700;
+        white-space: nowrap;
+    }
+    .kalk-bo-detail-title {
+        display: flex;
+        align-items: center;
+        gap: 0.65rem;
+        margin: 0.25rem 0 0.75rem 0;
+    }
+    .kalk-bo-detail-title h3 {
+        color: #052966;
+        font-size: 1.7rem;
+        font-weight: 900;
+        margin: 0;
+        line-height: 1.1;
+        overflow-wrap: anywhere;
+    }
+    .kalk-bo-summary-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.75rem;
+        margin: 0.75rem 0;
+    }
+    .kalk-bo-summary-card {
+        border: 2px solid #a9bee7;
+        border-radius: 8px;
+        padding: 0.65rem 0.8rem;
+        background: #ffffff;
+    }
+    .kalk-bo-summary-label {
+        color: #9bb4e4;
+        font-size: 0.78rem;
+        font-weight: 900;
+        text-transform: uppercase;
+        margin: 0;
+    }
+    .kalk-bo-summary-value {
+        color: #526487;
+        font-size: 1.35rem;
+        font-weight: 900;
+        margin: 0.1rem 0 0 0;
+    }
+    .kalk-bo-empty {
+        border: 2px dashed #a9bee7;
+        border-radius: 8px;
+        padding: 1rem;
+        background: #ffffff;
+        color: #526487;
+        font-weight: 700;
+        margin: 0.75rem 0;
+    }
+    .kalk-bo-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 0.75rem;
+        table-layout: fixed;
+    }
+    .kalk-bo-table th {
+        color: #052966;
+        background: linear-gradient(180deg, #ffffff, #d8e6fb);
+        border-bottom: 3px solid #111111;
+        font-size: 0.86rem;
+        letter-spacing: 0.02em;
+        padding: 0.5rem;
+        text-align: center;
+    }
+    .kalk-bo-table td {
+        color: #526487;
+        border-bottom: 2px solid #111111;
+        padding: 0.55rem 0.5rem;
+        text-align: center;
+        font-weight: 800;
+        overflow-wrap: anywhere;
+    }
+    .kalk-bo-table td:first-child,
+    .kalk-bo-table th:first-child {
+        text-align: left;
     }
     </style>
     """,
@@ -507,6 +719,304 @@ def persist_hierarchy_subsetores(subsetores_df: pd.DataFrame, db_path: Path = DB
                 (row["SUBSETOR"], row["SETORPAI"], row["LIDERMAT"]),
             )
         conn.commit()
+
+
+def init_kalk_bo_db(db_path: Path = DB_PATH) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kalk_bo_configs (
+                SCOPE_TYPE TEXT NOT NULL,
+                SCOPE_KEY TEXT NOT NULL,
+                SETOR TEXT DEFAULT '',
+                SUBSETOR TEXT DEFAULT '',
+                DRIVER_LABEL TEXT DEFAULT '',
+                INDICATOR_LABEL TEXT DEFAULT '',
+                YELLOW_MIN REAL DEFAULT 3.5,
+                GREEN_MIN REAL DEFAULT 4.5,
+                UPDATED_AT TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (SCOPE_TYPE, SCOPE_KEY)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kalk_bo_values (
+                SCOPE_TYPE TEXT NOT NULL,
+                SCOPE_KEY TEXT NOT NULL,
+                MAT TEXT NOT NULL,
+                DRIVER_VALUE REAL,
+                INDICATOR_VALUE REAL,
+                UPDATED_AT TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (SCOPE_TYPE, SCOPE_KEY, MAT)
+            )
+            """
+        )
+        conn.commit()
+
+
+def kalk_scope_key(scope_type: str, setor: str, subsetor: str = "") -> str:
+    setor = str(setor or "").strip()
+    subsetor = str(subsetor or "").strip()
+    return f"{setor}||{subsetor}" if scope_type == "subsetor" else setor
+
+
+def default_kalk_config(scope_type: str, setor: str, subsetor: str = "") -> dict:
+    return {
+        "SCOPE_TYPE": scope_type,
+        "SCOPE_KEY": kalk_scope_key(scope_type, setor, subsetor),
+        "SETOR": str(setor or "").strip(),
+        "SUBSETOR": str(subsetor or "").strip(),
+        "DRIVER_LABEL": "",
+        "INDICATOR_LABEL": "",
+        "YELLOW_MIN": 3.5,
+        "GREEN_MIN": 4.5,
+    }
+
+
+def load_kalk_bo_configs(db_path: Path = DB_PATH) -> dict[tuple[str, str], dict]:
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT SCOPE_TYPE, SCOPE_KEY, SETOR, SUBSETOR, DRIVER_LABEL, INDICATOR_LABEL,
+                   YELLOW_MIN, GREEN_MIN
+            FROM kalk_bo_configs
+            """,
+            conn,
+        )
+    configs: dict[tuple[str, str], dict] = {}
+    for _, row in df.iterrows():
+        scope_type = str(row.get("SCOPE_TYPE", "")).strip()
+        scope_key = str(row.get("SCOPE_KEY", "")).strip()
+        if scope_type and scope_key:
+            configs[(scope_type, scope_key)] = row.to_dict()
+    return configs
+
+
+def load_kalk_bo_values(db_path: Path = DB_PATH) -> pd.DataFrame:
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT SCOPE_TYPE, SCOPE_KEY, MAT, DRIVER_VALUE, INDICATOR_VALUE
+            FROM kalk_bo_values
+            """,
+            conn,
+            dtype={"SCOPE_TYPE": str, "SCOPE_KEY": str, "MAT": str},
+        )
+    for col in ["SCOPE_TYPE", "SCOPE_KEY", "MAT"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    return df
+
+
+def persist_kalk_bo_config(config: dict, db_path: Path = DB_PATH) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO kalk_bo_configs (
+                SCOPE_TYPE, SCOPE_KEY, SETOR, SUBSETOR, DRIVER_LABEL, INDICATOR_LABEL,
+                YELLOW_MIN, GREEN_MIN, UPDATED_AT
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(SCOPE_TYPE, SCOPE_KEY) DO UPDATE SET
+                SETOR = excluded.SETOR,
+                SUBSETOR = excluded.SUBSETOR,
+                DRIVER_LABEL = excluded.DRIVER_LABEL,
+                INDICATOR_LABEL = excluded.INDICATOR_LABEL,
+                YELLOW_MIN = excluded.YELLOW_MIN,
+                GREEN_MIN = excluded.GREEN_MIN,
+                UPDATED_AT = CURRENT_TIMESTAMP
+            """,
+            (
+                str(config.get("SCOPE_TYPE", "")).strip(),
+                str(config.get("SCOPE_KEY", "")).strip(),
+                str(config.get("SETOR", "")).strip(),
+                str(config.get("SUBSETOR", "")).strip(),
+                str(config.get("DRIVER_LABEL", "")).strip(),
+                str(config.get("INDICATOR_LABEL", "")).strip(),
+                float(config.get("YELLOW_MIN", 3.5) or 3.5),
+                float(config.get("GREEN_MIN", 4.5) or 4.5),
+            ),
+        )
+        conn.commit()
+
+
+def parse_optional_float(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    text = str(value).strip().replace(",", ".")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def persist_kalk_bo_values(scope_type: str, scope_key: str, edited_df: pd.DataFrame, db_path: Path = DB_PATH) -> None:
+    scope_type = str(scope_type or "").strip()
+    scope_key = str(scope_key or "").strip()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM kalk_bo_values WHERE SCOPE_TYPE = ? AND SCOPE_KEY = ?",
+            (scope_type, scope_key),
+        )
+        for _, row in edited_df.iterrows():
+            mat = str(row.get("MAT", "")).strip()
+            if not mat:
+                continue
+            driver_value = parse_optional_float(row.get("DRIVER"))
+            indicator_value = parse_optional_float(row.get("INDICADOR"))
+            if driver_value is None and indicator_value is None:
+                continue
+            conn.execute(
+                """
+                INSERT INTO kalk_bo_values (
+                    SCOPE_TYPE, SCOPE_KEY, MAT, DRIVER_VALUE, INDICATOR_VALUE, UPDATED_AT
+                )
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (scope_type, scope_key, mat, driver_value, indicator_value),
+            )
+        conn.commit()
+
+
+def kalk_image_data_uri(path: Path) -> str:
+    if not path.exists():
+        return ""
+    encoded = base64.b64encode(path.read_bytes()).decode()
+    return f"data:image/png;base64,{encoded}"
+
+
+def kalk_logo_html(css_class: str = "kalk-bo-logo") -> str:
+    data_uri = kalk_image_data_uri(KALK_BO_LOGO_PATH)
+    if not data_uri:
+        return ""
+    return f'<img class="{css_class}" src="{data_uri}" alt="KALK BO" />'
+
+
+def kalk_button_label() -> str:
+    data_uri = kalk_image_data_uri(KALK_BO_ICON_PATH)
+    if not data_uri:
+        return "KALK BO"
+    return f"![KALK BO]({data_uri}) KALK BO"
+
+
+def kalk_status_for_average(avg: float | None, config: dict, has_collaborators: bool) -> str:
+    driver_label = str(config.get("DRIVER_LABEL", "")).strip()
+    indicator_label = str(config.get("INDICATOR_LABEL", "")).strip()
+    if not has_collaborators or not driver_label or not indicator_label or avg is None:
+        return "pending"
+    yellow_min = float(config.get("YELLOW_MIN", 3.5) or 3.5)
+    green_min = float(config.get("GREEN_MIN", 4.5) or 4.5)
+    if avg >= green_min:
+        return "green"
+    if avg >= yellow_min:
+        return "yellow"
+    return "red"
+
+
+def status_dot_html(status: str) -> str:
+    color = KALK_STATUS_COLORS.get(status, KALK_STATUS_COLORS["pending"])
+    return f'<span class="kalk-bo-dot" style="background:{color}"></span>'
+
+
+def format_kalk_number(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if abs(value - round(value)) < 0.005:
+        return f"{value:.0f}"
+    return f"{value:.2f}".replace(".", ",")
+
+
+def collaborators_for_kalk_scope(df: pd.DataFrame, scope_type: str, setor: str, subsetor: str = "") -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    work = df.copy()
+    work["SETOR"] = work["SETOR"].fillna("").astype(str).str.strip()
+    work["SUBSETOR"] = work["SUBSETOR"].fillna("").astype(str).str.strip()
+    setor = str(setor or "").strip()
+    subsetor = str(subsetor or "").strip()
+    if scope_type == "subsetor":
+        scoped = work[(work["SETOR"] == setor) & (work["SUBSETOR"] == subsetor)]
+    else:
+        scoped = work[work["SETOR"] == setor]
+    return scoped.sort_values(["NOME", "MAT"]).reset_index(drop=True)
+
+
+def build_kalk_editor_df(collaborators_df: pd.DataFrame, values_df: pd.DataFrame, scope_type: str, scope_key: str) -> pd.DataFrame:
+    current_values = values_df[
+        (values_df["SCOPE_TYPE"] == scope_type) & (values_df["SCOPE_KEY"] == scope_key)
+    ].copy()
+    value_map = {
+        str(row.get("MAT", "")).strip(): row
+        for _, row in current_values.iterrows()
+        if str(row.get("MAT", "")).strip()
+    }
+    rows = []
+    for _, row in collaborators_df.iterrows():
+        mat = str(row.get("MAT", "")).strip()
+        value_row = value_map.get(mat, {})
+        rows.append(
+            {
+                "MAT": mat,
+                "NOME": str(row.get("NOME", "")).strip(),
+                "CARGO": str(row.get("CARGO", "")).strip(),
+                "DRIVER": value_row.get("DRIVER_VALUE", None),
+                "INDICADOR": value_row.get("INDICATOR_VALUE", None),
+            }
+        )
+    return pd.DataFrame(rows, columns=["MAT", "NOME", "CARGO", "DRIVER", "INDICADOR"])
+
+
+def kalk_scope_metrics(editor_df: pd.DataFrame, config: dict, has_collaborators: bool) -> dict:
+    driver_values = [parse_optional_float(value) for value in editor_df.get("DRIVER", pd.Series(dtype=object)).tolist()]
+    indicator_values = [parse_optional_float(value) for value in editor_df.get("INDICADOR", pd.Series(dtype=object)).tolist()]
+    driver_values = [value for value in driver_values if value is not None]
+    indicator_values = [value for value in indicator_values if value is not None]
+    driver_total = sum(driver_values) if driver_values else None
+    indicator_avg = statistics.mean(indicator_values) if indicator_values else None
+    status = kalk_status_for_average(indicator_avg, config, has_collaborators)
+    return {
+        "driver_total": driver_total,
+        "indicator_avg": indicator_avg,
+        "status": status,
+    }
+
+
+def kalk_config_for_scope(configs: dict[tuple[str, str], dict], scope_type: str, setor: str, subsetor: str = "") -> dict:
+    scope_key = kalk_scope_key(scope_type, setor, subsetor)
+    return configs.get((scope_type, scope_key), default_kalk_config(scope_type, setor, subsetor))
+
+
+def kalk_status_for_scope(
+    df: pd.DataFrame,
+    values_df: pd.DataFrame,
+    configs: dict[tuple[str, str], dict],
+    scope_type: str,
+    setor: str,
+    subsetor: str = "",
+) -> dict:
+    scope_key = kalk_scope_key(scope_type, setor, subsetor)
+    config = kalk_config_for_scope(configs, scope_type, setor, subsetor)
+    collaborators_df = collaborators_for_kalk_scope(df, scope_type, setor, subsetor)
+    editor_df = build_kalk_editor_df(collaborators_df, values_df, scope_type, scope_key)
+    metrics = kalk_scope_metrics(editor_df, config, not collaborators_df.empty)
+    return {**metrics, "collaborator_count": len(collaborators_df), "config": config}
+
+
+def aggregate_kalk_sector_status(child_statuses: list[str]) -> str:
+    active_statuses = [status for status in child_statuses if status != "pending"]
+    if not active_statuses:
+        return "pending"
+    if "red" in active_statuses:
+        return "red"
+    if "yellow" in active_statuses:
+        return "yellow"
+    return "green"
 
 
 def get_sector_scope_ids(
@@ -3086,14 +3596,8 @@ def render_brand_header() -> None:
     st.markdown(
         f"""
         <div class="brand-header">
-            <div class="brand-header-left">{logo_html}</div>
-            <div class="brand-header-center">
-                <div class="brand-title-block">
-                    <h1 class="brand-title">Organograma da Empresa</h1>
-                    <p class="brand-subtitle">Visualizacao baseada no arquivo organograma.csv</p>
-                </div>
-            </div>
-            <div class="brand-header-right">{logo_html}</div>
+                <div class="brand-header-logo">{logo_html}</div>
+                <h1 class="brand-title">Organograma da Empresa</h1>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3311,6 +3815,584 @@ def render_collaborator_editor(
 
     if st.session_state.get("collab_dialog_open"):
         collaborator_dialog()
+
+
+def all_kalk_sectors(df: pd.DataFrame, setores_df: pd.DataFrame, subsetores_df: pd.DataFrame) -> list[str]:
+    ordered: list[str] = []
+
+    def add(value: str) -> None:
+        value = str(value or "").strip()
+        if value and value not in ordered:
+            ordered.append(value)
+
+    if setores_df is not None and not setores_df.empty:
+        for value in setores_df.get("SETOR", pd.Series(dtype=str)).tolist():
+            add(value)
+    if subsetores_df is not None and not subsetores_df.empty:
+        for value in subsetores_df.get("SETORPAI", pd.Series(dtype=str)).tolist():
+            add(value)
+    if "SETOR" in df.columns:
+        for value in sorted({str(value).strip() for value in df["SETOR"].tolist() if str(value).strip()}, key=str.casefold):
+            add(value)
+    return ordered
+
+
+def select_kalk_scope(scope_type: str, setor: str, subsetor: str = "") -> None:
+    st.session_state["kalk_bo_scope_type"] = scope_type
+    st.session_state["kalk_bo_scope_setor"] = str(setor or "").strip()
+    st.session_state["kalk_bo_scope_subsetor"] = str(subsetor or "").strip()
+
+
+def consume_kalk_bo_query() -> None:
+    scope_type = st.query_params.get("kalk_bo_scope_type", "")
+    setor = st.query_params.get("kalk_bo_setor", "")
+    subsetor = st.query_params.get("kalk_bo_subsetor", "")
+    if isinstance(scope_type, list):
+        scope_type = scope_type[0] if scope_type else ""
+    if isinstance(setor, list):
+        setor = setor[0] if setor else ""
+    if isinstance(subsetor, list):
+        subsetor = subsetor[0] if subsetor else ""
+    scope_type = str(scope_type or "").strip()
+    setor = str(setor or "").strip()
+    subsetor = str(subsetor or "").strip()
+    if scope_type in {"setor", "subsetor"} and setor:
+        st.session_state["kalk_bo_open"] = True
+        select_kalk_scope(scope_type, setor, subsetor)
+        for key in ["kalk_bo_scope_type", "kalk_bo_setor", "kalk_bo_subsetor"]:
+            if key in st.query_params:
+                del st.query_params[key]
+        st.rerun()
+
+
+def kalk_detail_href(scope_type: str, setor: str, subsetor: str = "") -> str:
+    params = {
+        "kalk_bo_scope_type": scope_type,
+        "kalk_bo_setor": str(setor or "").strip(),
+        "kalk_bo_subsetor": str(subsetor or "").strip(),
+    }
+    return "?" + urllib.parse.urlencode(params)
+
+
+def render_kalk_result_table(editor_df: pd.DataFrame, config: dict) -> None:
+    driver_label = str(config.get("DRIVER_LABEL", "")).strip() or "Driver"
+    indicator_label = str(config.get("INDICATOR_LABEL", "")).strip() or "Indicador"
+    rows_html = []
+    for _, row in editor_df.iterrows():
+        indicator_value = parse_optional_float(row.get("INDICADOR"))
+        status = kalk_status_for_average(indicator_value, config, True)
+        rows_html.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('NOME', '')).strip())}</td>"
+            f"<td>{format_kalk_number(parse_optional_float(row.get('DRIVER')))} {status_dot_html(status)}</td>"
+            f"<td>{format_kalk_number(indicator_value)} {status_dot_html(status)}</td>"
+            "</tr>"
+        )
+    if not rows_html:
+        rows_html.append('<tr><td colspan="3">Nenhum colaborador encontrado no organograma.</td></tr>')
+    st.markdown(
+        f"""
+        <table class="kalk-bo-table">
+            <thead>
+                <tr>
+                    <th>Colaborador</th>
+                    <th>{html.escape(driver_label)}</th>
+                    <th>{html.escape(indicator_label)}</th>
+                </tr>
+            </thead>
+            <tbody>
+                {''.join(rows_html)}
+            </tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_kalk_bo_detail(
+    df: pd.DataFrame,
+    values_df: pd.DataFrame,
+    configs: dict[tuple[str, str], dict],
+    scope_type: str,
+    setor: str,
+    subsetor: str = "",
+    *,
+    editor_mode: bool = True,
+    show_settings_button: bool = False,
+    show_visualization: bool = True,
+) -> None:
+    scope_key = kalk_scope_key(scope_type, setor, subsetor)
+    config = kalk_config_for_scope(configs, scope_type, setor, subsetor)
+    title = subsetor if scope_type == "subsetor" else setor
+    collaborators_df = collaborators_for_kalk_scope(df, scope_type, setor, subsetor)
+    editor_base = build_kalk_editor_df(collaborators_df, values_df, scope_type, scope_key)
+
+    title_col, settings_col = st.columns([0.9, 0.1], vertical_alignment="center")
+    with title_col:
+        st.markdown(
+            f"""
+            <div class="kalk-bo-detail-title">
+                {status_dot_html(kalk_scope_metrics(editor_base, config, not collaborators_df.empty)["status"])}
+                <h3>{html.escape(title)}</h3>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with settings_col:
+        if show_settings_button:
+            if st.button(
+                " ",
+                key=f"kalk_bo_settings_detail_{scope_type}_{scope_key}",
+                help="Configurar produtividade",
+                use_container_width=True,
+                type="tertiary",
+                icon=":material/settings:",
+            ):
+                st.session_state["kalk_bo_modal_open"] = True
+                st.rerun()
+
+    if editor_mode:
+        close_col, _ = st.columns([0.18, 0.82])
+
+        with st.form(f"kalk_bo_config_form_{scope_type}_{scope_key}"):
+            form_col1, form_col2 = st.columns(2)
+            with form_col1:
+                driver_label = st.text_input(
+                    "Driver",
+                    value=str(config.get("DRIVER_LABEL", "")).strip(),
+                    placeholder="Ex.: N de chamados",
+                )
+            with form_col2:
+                indicator_label = st.text_input(
+                    "Indicador",
+                    value=str(config.get("INDICATOR_LABEL", "")).strip(),
+                    placeholder="Ex.: SLA do chamado",
+                )
+            range_col1, range_col2 = st.columns(2)
+            with range_col1:
+                yellow_min = st.number_input(
+                    "Minimo para amarelo",
+                    value=float(config.get("YELLOW_MIN", 3.5) or 3.5),
+                    step=0.1,
+                    format="%.2f",
+                )
+            with range_col2:
+                green_min = st.number_input(
+                    "Minimo para verde",
+                    value=float(config.get("GREEN_MIN", 4.5) or 4.5),
+                    step=0.1,
+                    format="%.2f",
+                )
+            save_config = st.form_submit_button("Salvar configuracao", type="primary", use_container_width=True)
+
+        if save_config:
+            if yellow_min > green_min:
+                st.error("O minimo para amarelo deve ser menor ou igual ao minimo para verde.")
+            else:
+                persist_kalk_bo_config(
+                    {
+                        "SCOPE_TYPE": scope_type,
+                        "SCOPE_KEY": scope_key,
+                        "SETOR": setor,
+                        "SUBSETOR": subsetor,
+                        "DRIVER_LABEL": driver_label,
+                        "INDICATOR_LABEL": indicator_label,
+                        "YELLOW_MIN": yellow_min,
+                        "GREEN_MIN": green_min,
+                    }
+                )
+                st.success("Configuracao do KALK BO salva.")
+                st.rerun()
+
+    driver_label = str(config.get("DRIVER_LABEL", "")).strip()
+    indicator_label = str(config.get("INDICATOR_LABEL", "")).strip()
+    if not driver_label or not indicator_label:
+        st.markdown(
+            """
+            <div class="kalk-bo-empty">
+                Aguardando cadastro de driver e indicador para ativar este setor/subsetor.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    if collaborators_df.empty:
+        st.markdown(
+            """
+            <div class="kalk-bo-empty">
+                Nenhum colaborador foi encontrado no organograma para este recorte.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if editor_mode:
+        edited_values = st.data_editor(
+            editor_base,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["MAT", "NOME", "CARGO"],
+            key=f"kalk_bo_values_editor_{scope_type}_{scope_key}",
+            column_config={
+                "MAT": st.column_config.TextColumn("MAT"),
+                "NOME": st.column_config.TextColumn("Colaborador"),
+                "CARGO": st.column_config.TextColumn("Cargo"),
+                "DRIVER": st.column_config.NumberColumn(driver_label or "Driver", step=1.0, format="%.2f"),
+                "INDICADOR": st.column_config.NumberColumn(indicator_label or "Indicador", step=0.1, format="%.2f"),
+            },
+        )
+        save_values = st.button(
+            "Salvar lancamentos",
+            type="primary",
+            use_container_width=True,
+            key=f"kalk_bo_save_values_{scope_type}_{scope_key}",
+            disabled=collaborators_df.empty,
+        )
+        if save_values:
+            persist_kalk_bo_values(scope_type, scope_key, edited_values)
+            st.success("Lancamentos de produtividade salvos.")
+            st.rerun()
+    else:
+        edited_values = editor_base
+
+    if show_visualization:
+        metrics = kalk_scope_metrics(edited_values, config, not collaborators_df.empty)
+        st.markdown(
+            f"""
+            <div class="kalk-bo-summary-grid">
+                <div class="kalk-bo-summary-card">
+                    <p class="kalk-bo-summary-label">Driver total do setor (soma)</p>
+                    <p class="kalk-bo-summary-value">{format_kalk_number(metrics["driver_total"])} {status_dot_html(metrics["status"])}</p>
+                </div>
+                <div class="kalk-bo-summary-card">
+                    <p class="kalk-bo-summary-label">Indicador total do setor (media)</p>
+                    <p class="kalk-bo-summary-value">{format_kalk_number(metrics["indicator_avg"])} {status_dot_html(metrics["status"])}</p>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        render_kalk_result_table(edited_values, config)
+
+
+def render_kalk_bo_sector_list(
+    df: pd.DataFrame,
+    values_df: pd.DataFrame,
+    configs: dict[tuple[str, str], dict],
+    setores: list[str],
+    subsetores_map: dict[str, list[str]],
+) -> None:
+    if not setores:
+        st.html(
+            '<div class="kalk-bo-empty">Nenhum setor encontrado.</div>',
+        )
+        return
+
+    st.html(
+        """
+        <style>
+        div[class*="st-key-kalk_"][class*="_card"] {
+            margin-bottom: 0.25rem;
+        }
+        div[class*="st-key-kalk_"][class*="_card"] div[data-testid="stVerticalBlockBorderWrapper"] {
+            border-color: #c7d3e5;
+            border-radius: 8px;
+            background: #ffffff;
+            padding: 0 !important;
+        }
+        div[class*="st-key-kalk_"][class*="_card"] div[data-testid="stVerticalBlockBorderWrapper"] > div {
+            width: 100%;
+        }
+        div[class*="st-key-kalk_"][class*="_card"] div[data-testid="stVerticalBlock"] {
+            gap: 0;
+        }
+        div[class*="st-key-kalk_"][class*="_card"] div[data-testid="stHorizontalBlock"] {
+            min-height: 44px;
+            padding: 0 !important;
+            align-items: center !important;
+            gap: 0.35rem !important;
+        }
+        div[class*="st-key-kalk_"][class*="_child_card"] div[data-testid="stVerticalBlockBorderWrapper"] {
+            background: #edf3fb;
+        }
+        div[class*="st-key-kalk_"][class*="_card"] div[data-testid="column"] {
+            min-height: 2rem;
+            display: flex !important;
+            flex-direction: column !important;
+            justify-content: center !important;
+        }
+        div[class*="st-key-kalk_"][class*="_card"] div[data-testid="stElementContainer"] {
+            margin: 0 !important;
+            min-height: 1.8rem;
+            display: flex;
+            align-items: center;
+        }
+        .kalk-card-dot-wrap,
+        .kalk-card-name,
+        .kalk-card-meta {
+            min-height: 1.8rem;
+            display: flex;
+            align-items: center;
+        }
+        .kalk-card-dot-wrap {
+            justify-content: center;
+        }
+        .kalk-card-dot-wrap .kalk-bo-dot {
+            width: 18px;
+            height: 18px;
+            margin: 0;
+        }
+        .kalk-card-name {
+            color: #052966;
+            font-size: 18px;
+            font-weight: 900;
+            line-height: 1.2;
+            text-align: left;
+            justify-content: flex-start;
+            overflow-wrap: anywhere;
+        }
+        .kalk-card-meta {
+            color: #53657f;
+            font-size: 14px;
+            font-weight: 800;
+            line-height: 1.2;
+            white-space: nowrap;
+            text-align: right;
+            justify-content: flex-end;
+        }
+        div[class*="st-key-kalk_"][class*="_toggle"] button,
+        div[class*="st-key-kalk_"][class*="_detail"] button,
+        div[class*="st-key-kalk_"][class*="_settings"] button,
+        div[class*="st-key-kalk_"][class*="_close"] button,
+        div[class*="st-key-kalk_bo_close"] button {
+            border: 0 !important;
+            background: transparent !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+            min-height: 2rem !important;
+            color: #2f686b !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+        div[class*="st-key-kalk_"][class*="_toggle"] button:hover,
+        div[class*="st-key-kalk_"][class*="_detail"] button:hover,
+        div[class*="st-key-kalk_"][class*="_settings"] button:hover,
+        div[class*="st-key-kalk_"][class*="_close"] button:hover,
+        div[class*="st-key-kalk_bo_close"] button:hover {
+            background: rgba(47, 104, 107, 0.08) !important;
+        }
+        div[class*="st-key-kalk_"][class*="_toggle"] button p,
+        div[class*="st-key-kalk_"][class*="_detail"] button p,
+        div[class*="st-key-kalk_"][class*="_settings"] button p,
+        div[class*="st-key-kalk_"][class*="_close"] button p,
+        div[class*="st-key-kalk_bo_close"] button p {
+            display: none;
+        }
+        div[class*="st-key-kalk_"][class*="_toggle"] button span,
+        div[class*="st-key-kalk_"][class*="_detail"] button span,
+        div[class*="st-key-kalk_"][class*="_settings"] button span,
+        div[class*="st-key-kalk_"][class*="_close"] button span,
+        div[class*="st-key-kalk_bo_close"] button span {
+            font-size: 1.45rem !important;
+        }
+        </style>
+        """
+    )
+
+    expanded_key = "kalk_bo_expanded_setores"
+    expanded = set(st.session_state.get(expanded_key, []))
+
+    def render_card(
+        *,
+        name: str,
+        status: str,
+        meta: str,
+        key_prefix: str,
+        scope_type: str | None = None,
+        setor: str = "",
+        subsetor: str = "",
+        has_children: bool = False,
+        child: bool = False,
+    ) -> None:
+        suffix = "_child_card" if child else "_card"
+        with st.container(border=True, key=f"{key_prefix}{suffix}"):
+            cols = st.columns([0.06, 0.66, 0.2, 0.08], vertical_alignment="center")
+            with cols[0]:
+                st.html(f'<div class="kalk-card-dot-wrap">{status_dot_html(status)}</div>')
+            with cols[1]:
+                st.html(f'<div class="kalk-card-name">{html.escape(name)}</div>')
+            with cols[2]:
+                st.html(f'<div class="kalk-card-meta">{html.escape(meta)}</div>')
+            with cols[3]:
+                if has_children:
+                    is_expanded = setor in expanded
+                    icon = ":material/keyboard_arrow_up:" if is_expanded else ":material/keyboard_arrow_down:"
+                    if st.button(
+                        " ",
+                        key=f"{key_prefix}_toggle",
+                        help="Abrir subsetores",
+                        use_container_width=True,
+                        type="tertiary",
+                        icon=icon,
+                    ):
+                        if is_expanded:
+                            expanded.discard(setor)
+                        else:
+                            expanded.add(setor)
+                        st.session_state[expanded_key] = sorted(expanded)
+                        st.rerun()
+                elif scope_type:
+                    if st.button(
+                        " ",
+                        key=f"{key_prefix}_detail",
+                        help="Ver detalhes",
+                        use_container_width=True,
+                        type="tertiary",
+                        icon=":material/visibility:",
+                    ):
+                        st.session_state["kalk_bo_modal_open"] = False
+                        select_kalk_scope(scope_type, setor, subsetor)
+                        st.rerun()
+
+    for idx, setor in enumerate(setores):
+        subsetores = subsetores_map.get(setor, [])
+        if subsetores:
+            child_statuses = [
+                kalk_status_for_scope(df, values_df, configs, "subsetor", setor, subsetor)["status"]
+                for subsetor in subsetores
+            ]
+            render_card(
+                name=setor,
+                status=aggregate_kalk_sector_status(child_statuses),
+                meta=f"{len(subsetores)} subsetores",
+                key_prefix=f"kalk_sector_{idx}",
+                setor=setor,
+                has_children=True,
+            )
+            if setor in expanded:
+                for child_idx, subsetor in enumerate(subsetores):
+                    status_info = kalk_status_for_scope(df, values_df, configs, "subsetor", setor, subsetor)
+                    _, child_col = st.columns([0.06, 0.94])
+                    with child_col:
+                        render_card(
+                            name=subsetor,
+                            status=status_info["status"],
+                            meta=f'{status_info["collaborator_count"]} colab.',
+                            key_prefix=f"kalk_subsetor_{idx}_{child_idx}",
+                            scope_type="subsetor",
+                            setor=setor,
+                            subsetor=subsetor,
+                            child=True,
+                        )
+        else:
+            status_info = kalk_status_for_scope(df, values_df, configs, "setor", setor)
+            render_card(
+                name=setor,
+                status=status_info["status"],
+                meta=f'{status_info["collaborator_count"]} colab.',
+                key_prefix=f"kalk_sector_{idx}",
+                scope_type="setor",
+                setor=setor,
+            )
+
+
+def render_kalk_bo(
+    df: pd.DataFrame,
+    setores_df: pd.DataFrame,
+    supersetores_df: pd.DataFrame,
+    subsetores_df: pd.DataFrame,
+) -> None:
+    try:
+        configs = load_kalk_bo_configs()
+        values_df = load_kalk_bo_values()
+    except Exception as exc:
+        st.error(f"Nao foi possivel carregar dados do KALK BO: {exc}")
+        return
+
+    subsetores_map = subsetores_by_setor(subsetores_df, df)
+    setores = all_kalk_sectors(df, setores_df, subsetores_df)
+
+    @st.dialog("KALK BO", width="large")
+    def kalk_bo_modal() -> None:
+        scope_type = str(st.session_state.get("kalk_bo_scope_type", "")).strip()
+        setor = str(st.session_state.get("kalk_bo_scope_setor", "")).strip()
+        subsetor = str(st.session_state.get("kalk_bo_scope_subsetor", "")).strip()
+        if scope_type and setor:
+            render_kalk_bo_detail(
+                df,
+                values_df,
+                configs,
+                scope_type,
+                setor,
+                subsetor,
+                editor_mode=True,
+                show_settings_button=False,
+                show_visualization=False,
+            )
+        else:
+            st.caption("Selecione um setor ou subsetor para configurar.")
+
+    with st.container(border=True):
+        header_col, close_col = st.columns([30, 1])
+        with header_col:
+            st.markdown(
+                f"""
+                <div class="kalk-bo-header">
+                    <div class="kalk-bo-title-wrap">
+                        {kalk_logo_html()}
+                        <div>
+                            <p class="kalk-bo-title">KALK BO</p>
+                            <p class="kalk-bo-subtitle">Produtividade por setor, subsetor e colaborador</p>
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with close_col:
+            if st.button(
+                " ",
+                key="kalk_bo_close",
+                help="Fechar KALK BO",
+                use_container_width=True,
+                type="tertiary",
+                icon=":material/close:",
+            ):
+                st.session_state["kalk_bo_open"] = False
+                st.rerun()
+
+        left_col, right_col = st.columns([1.05, 1])
+        with left_col:
+            st.markdown("**Setores**")
+            render_kalk_bo_sector_list(df, values_df, configs, setores, subsetores_map)
+
+        with right_col:
+            scope_type = str(st.session_state.get("kalk_bo_scope_type", "")).strip()
+            setor = str(st.session_state.get("kalk_bo_scope_setor", "")).strip()
+            subsetor = str(st.session_state.get("kalk_bo_scope_subsetor", "")).strip()
+            if scope_type and setor:
+                render_kalk_bo_detail(
+                    df,
+                    values_df,
+                    configs,
+                    scope_type,
+                    setor,
+                    subsetor,
+                    editor_mode=False,
+                    show_settings_button=True,
+                    show_visualization=True,
+                )
+            else:
+                st.markdown(
+                    """
+                    <div class="kalk-bo-empty">
+                        Selecione um setor sem subsetores ou abra um setor com subsetores para detalhar um subsetor.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+    if st.session_state.get("kalk_bo_modal_open"):
+        kalk_bo_modal()
 
 
 def build_hierarchy_network(
@@ -3566,7 +4648,9 @@ def main():
     try:
         init_collaborator_db(path)
         init_hierarchy_db(setores_path, supersetores_path, subsetores_path)
+        init_kalk_bo_db()
         consume_crud_query()
+        consume_kalk_bo_query()
         df = load_collaborators_from_db()
     except Exception as exc:
         st.error(f"Erro ao carregar colaboradores: {exc}")
@@ -3593,16 +4677,16 @@ def main():
         st.session_state["selected_suggestion_idx"] = 0
     if "hierarchy_open" not in st.session_state:
         st.session_state["hierarchy_open"] = False
+    if "kalk_bo_open" not in st.session_state:
+        st.session_state["kalk_bo_open"] = False
+    if "horizontal_view" not in st.session_state:
+        st.session_state["horizontal_view"] = False
     if st.session_state.get("crud_errors"):
         st.error("Nao foi possivel salvar uma ou mais alteracoes: " + " | ".join(st.session_state["crud_errors"]))
 
     sidebar_view = str(st.session_state.get("sidebar_view", "none"))
     if sidebar_view in {"ranking", "suggestions"}:
         request_sidebar_open()
-
-    _, top_right = st.columns([8, 2])
-    with top_right:
-        horizontal_view = st.toggle("Modo horizontal", value=False)
 
     with st.container(border=True):
         st.markdown('<p class="filter-card-title">Filtros</p>', unsafe_allow_html=True)
@@ -3641,7 +4725,7 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-    action_col1, action_col2, action_col3, _ = st.columns([1.35, 1.7, 1.75, 2.75])
+    action_col1, action_col2, action_col3, action_col4, _ = st.columns([1.35, 1.7, 1.75, 1.35, 2.0])
     with action_col1:
         if st.button("Mostrar ranking de span", use_container_width=True):
             st.session_state["sidebar_view"] = "ranking"
@@ -3654,6 +4738,10 @@ def main():
         if st.button("Hierarquia de setores", use_container_width=True):
             st.session_state["hierarchy_open"] = not bool(st.session_state.get("hierarchy_open"))
             st.rerun()
+    with action_col4:
+        if st.button(kalk_button_label(), use_container_width=True, key="open_kalk_bo_button"):
+            st.session_state["kalk_bo_open"] = not bool(st.session_state.get("kalk_bo_open"))
+            st.rerun()
 
     filtered, edge_count, highlighted_ids = build_graph(
         df,
@@ -3662,6 +4750,7 @@ def main():
         setores_df=setores_df,
         selected_setores=selected_setores,
     )
+    horizontal_view = bool(st.session_state.get("horizontal_view", False))
     direction = "LR" if horizontal_view else "UD"
     ranking_df = build_span_ranking(filtered)
     suggestions = generate_reorg_suggestions(filtered)
@@ -3769,6 +4858,9 @@ def main():
     if st.session_state.get("hierarchy_open"):
         render_hierarchy_manager(df, setores_df, supersetores_df, subsetores_df)
 
+    if st.session_state.get("kalk_bo_open"):
+        render_kalk_bo(df, setores_df, supersetores_df, subsetores_df)
+
     if filtered.empty:
         st.warning("Nenhum resultado para os filtros selecionados.")
         return
@@ -3838,7 +4930,15 @@ def main():
             )
             render_pyvis(net_proposed, containers=containers_proposed, height=520, enable_crud=False)
 
-    st.subheader("Visualizacao")
+    view_title_col, view_toggle_col = st.columns([0.78, 0.22], vertical_alignment="center")
+    with view_title_col:
+        st.markdown(
+            '<div class="visualization-header"><h3>Visualização</h3></div>',
+            unsafe_allow_html=True,
+        )
+    with view_toggle_col:
+        st.toggle("Modo horizontal", key="horizontal_view")
+
     net, containers = build_pyvis_network(
         filtered,
         direction=direction,
@@ -3879,4 +4979,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
