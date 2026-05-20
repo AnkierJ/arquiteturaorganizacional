@@ -2389,6 +2389,7 @@ def build_pyvis_network(
             "hover": True,
             "dragView": True,
             "zoomView": True,
+            "zoomSpeed": 0.35,
             "navigationButtons": True,
         },
     }
@@ -2630,6 +2631,9 @@ def render_pyvis(
         const STORAGE_KEY = 'org_chart_crud_changes_v1';
         const MIN_ZOOM_LEVEL = 0.18;
         const MAX_ZOOM_LEVEL = 2.5;
+        const WHEEL_ZOOM_SENSITIVITY = 0.0017;
+        const TRACKPAD_ZOOM_SENSITIVITY = 0.004;
+        const MAX_WHEEL_ZOOM_DELTA = 120;
         const NODE_LABEL_MAX_CHARS = 26;
         const NODE_LABEL_CHAR_WIDTH = 7.2;
         const NODE_LABEL_HORIZONTAL_PADDING = 44;
@@ -2637,6 +2641,8 @@ def render_pyvis(
         let initialViewApplied = false;
         let modalInstalled = false;
         let isClampingZoom = false;
+        let wheelZoomInstalled = false;
+        let lastZoomSafeView = null;
         let localSearchState = { query: '', matches: [], currentIndex: 0 };
 
         function getVisNetwork() {
@@ -2785,23 +2791,125 @@ def render_pyvis(
             ctx.restore();
         }
 
+        function rememberZoomView(visNetwork) {
+            if (!visNetwork || typeof visNetwork.getScale !== 'function' || typeof visNetwork.getViewPosition !== 'function') return;
+            const scale = visNetwork.getScale();
+            if (!Number.isFinite(scale) || scale < MIN_ZOOM_LEVEL || scale > MAX_ZOOM_LEVEL) return;
+            const position = visNetwork.getViewPosition();
+            if (!position || !Number.isFinite(position.x) || !Number.isFinite(position.y)) return;
+            lastZoomSafeView = {
+                scale: scale,
+                position: { x: position.x, y: position.y }
+            };
+        }
+
         function clampZoom(visNetwork) {
             if (!visNetwork || typeof visNetwork.getScale !== 'function' || typeof visNetwork.moveTo !== 'function') return;
             if (isClampingZoom) return;
             const scale = visNetwork.getScale();
             if (!Number.isFinite(scale)) return;
-            if (scale >= MIN_ZOOM_LEVEL && scale <= MAX_ZOOM_LEVEL) return;
+            if (scale >= MIN_ZOOM_LEVEL && scale <= MAX_ZOOM_LEVEL) {
+                rememberZoomView(visNetwork);
+                return;
+            }
             isClampingZoom = true;
             const targetScale = Math.min(Math.max(scale, MIN_ZOOM_LEVEL), MAX_ZOOM_LEVEL);
-            const position = typeof visNetwork.getViewPosition === 'function' ? visNetwork.getViewPosition() : undefined;
+            const currentPosition = typeof visNetwork.getViewPosition === 'function' ? visNetwork.getViewPosition() : undefined;
+            const position = lastZoomSafeView && lastZoomSafeView.position ? lastZoomSafeView.position : currentPosition;
             visNetwork.moveTo({
                 position: position,
                 scale: targetScale,
                 animation: false
             });
+            lastZoomSafeView = {
+                scale: targetScale,
+                position: position
+            };
             window.setTimeout(function() {
                 isClampingZoom = false;
             }, 0);
+        }
+
+        function normalizeWheelDelta(event) {
+            let delta = Number(event.deltaY) || 0;
+            if (event.deltaMode === 1) delta *= 16;
+            if (event.deltaMode === 2) delta *= 600;
+            return Math.max(-MAX_WHEEL_ZOOM_DELTA, Math.min(MAX_WHEEL_ZOOM_DELTA, delta));
+        }
+
+        function relativePointer(event, element) {
+            const rect = element.getBoundingClientRect();
+            return {
+                x: event.clientX - rect.left,
+                y: event.clientY - rect.top,
+                width: rect.width,
+                height: rect.height
+            };
+        }
+
+        function zoomPositionForPointer(visNetwork, pointer, targetScale) {
+            if (!visNetwork || typeof visNetwork.DOMtoCanvas !== 'function') return undefined;
+            const canvasPoint = visNetwork.DOMtoCanvas({ x: pointer.x, y: pointer.y });
+            if (!canvasPoint || !Number.isFinite(canvasPoint.x) || !Number.isFinite(canvasPoint.y)) return undefined;
+            return {
+                x: canvasPoint.x - ((pointer.x - (pointer.width / 2)) / targetScale),
+                y: canvasPoint.y - ((pointer.y - (pointer.height / 2)) / targetScale)
+            };
+        }
+
+        function applyWheelZoom(visNetwork, networkDiv, event) {
+            if (!visNetwork || typeof visNetwork.getScale !== 'function' || typeof visNetwork.moveTo !== 'function') return;
+            const currentScale = visNetwork.getScale();
+            if (!Number.isFinite(currentScale)) return;
+            const delta = normalizeWheelDelta(event);
+            if (delta === 0) return;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+
+            const atMinZoom = currentScale <= MIN_ZOOM_LEVEL + 0.0001;
+            const atMaxZoom = currentScale >= MAX_ZOOM_LEVEL - 0.0001;
+            if ((atMinZoom && delta > 0) || (atMaxZoom && delta < 0)) {
+                rememberZoomView(visNetwork);
+                return;
+            }
+
+            const isLikelyTrackpad = event.ctrlKey || Math.abs(Number(event.deltaY) || 0) < 50;
+            const sensitivity = isLikelyTrackpad ? TRACKPAD_ZOOM_SENSITIVITY : WHEEL_ZOOM_SENSITIVITY;
+            const requestedScale = currentScale * Math.exp(-delta * sensitivity);
+            const targetScale = Math.min(Math.max(requestedScale, MIN_ZOOM_LEVEL), MAX_ZOOM_LEVEL);
+            if (!Number.isFinite(targetScale) || Math.abs(targetScale - currentScale) < 0.0001) {
+                rememberZoomView(visNetwork);
+                return;
+            }
+
+            const canvas = networkDiv.querySelector('canvas');
+            const pointerElement = canvas || networkDiv;
+            const pointer = relativePointer(event, pointerElement);
+            const position = zoomPositionForPointer(visNetwork, pointer, targetScale)
+                || (typeof visNetwork.getViewPosition === 'function' ? visNetwork.getViewPosition() : undefined);
+            isClampingZoom = true;
+            visNetwork.moveTo({
+                position: position,
+                scale: targetScale,
+                animation: false
+            });
+            lastZoomSafeView = {
+                scale: targetScale,
+                position: position
+            };
+            window.setTimeout(function() {
+                isClampingZoom = false;
+                scheduleRedraw();
+            }, 0);
+        }
+
+        function installWheelZoomControl(visNetwork, networkDiv) {
+            if (wheelZoomInstalled || !networkDiv || !networkDiv.addEventListener) return;
+            wheelZoomInstalled = true;
+            networkDiv.addEventListener('wheel', function(event) {
+                if (event.target && event.target.closest && event.target.closest('.org-crud-toolbar, .collab-modal-backdrop')) return;
+                applyWheelZoom(visNetwork, networkDiv, event);
+            }, { capture: true, passive: false });
         }
 
         function drawContainers(ctx, data, visNetwork) {
@@ -3495,6 +3603,7 @@ def render_pyvis(
             const networkDiv = document.getElementById('mynetwork');
             if (!visNetwork || !networkDiv) return false;
             networkDiv.style.position = 'relative';
+            installWheelZoomControl(visNetwork, networkDiv);
             bindNetworkEvents(visNetwork);
             if (crudEnabled) {
                 if (!ensureCrudUi(networkDiv, visNetwork)) return false;
@@ -4569,7 +4678,7 @@ def build_hierarchy_network(
         "layout": {"hierarchical": {"enabled": False}},
         "physics": {"enabled": False},
         "edges": {"smooth": {"enabled": False}},
-        "interaction": {"hover": True, "dragView": True, "zoomView": True, "navigationButtons": True},
+        "interaction": {"hover": True, "dragView": True, "zoomView": True, "zoomSpeed": 0.35, "navigationButtons": True},
     }
     net.set_options(json.dumps(options))
     return net
