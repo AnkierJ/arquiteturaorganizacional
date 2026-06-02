@@ -1,6 +1,6 @@
-﻿SUBSETOR;SETORPAI;LIDERMAT
+SUBSETOR;SETORPAI;LIDERMAT
 Contas a Pagar;Gerência Financeira;
-Contas a Receber;Gerência Financeira;
+Contas a Receber;Gerência Financeira;4353
 Tesouraria;Gerência Financeira;
 Cobrança;Gerência Financeira;
 Coord. Fiscal Tributária;Gerência Contábil Fiscal;2918
@@ -11,7 +11,6 @@ Novos Desenvolvimentos;TEX;3521
 Sustentação;TEX;2976
 TEX4OPS;TEX;2945
 Compradores;Compras de Consumo e Serviço;
-CSC;Compras de Consumo e Serviço;
 Obras;Obras e Manutenção;
 Manutenção;Obras e Manutenção;
 Agentes;Segurança;
@@ -24,3 +23,4 @@ BPs;Gente e Cultura;
 Folha de Pagamento;Departamento Pessoal;
 Benefícios;Departamento Pessoal;
 Ponto;Departamento Pessoal;
+Lançadores;Compras de Consumo e Serviço;

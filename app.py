@@ -1526,7 +1526,7 @@ def build_org_leader_lookup(
         subsetor = str(row.get("SUBSETOR", "")).strip()
         leader_mat = str(row.get("LIDERMAT", "")).strip()
         leader_area = collaborator_area.get(leader_mat)
-        if setor and subsetor and leader_mat and leader_area == (setor, subsetor):
+        if setor and subsetor and leader_mat and leader_area:
             subsetor_leaders[(setor, subsetor)] = leader_mat
 
     return subsetor_leaders, sector_leaders
@@ -1538,15 +1538,19 @@ def org_leader_mat_for(
     excluded_mat: str,
     subsetor_leaders: dict[tuple[str, str], str],
     sector_leaders: dict[str, str],
+    ignored_mats: set[str] | None = None,
 ) -> str:
     setor = str(setor or "").strip()
     subsetor = str(subsetor or "").strip()
     excluded_mat = str(excluded_mat or "").strip()
+    ignored = {str(value).strip() for value in (ignored_mats or set()) if str(value).strip()}
+    if excluded_mat:
+        ignored.add(excluded_mat)
     subsetor_leader = subsetor_leaders.get((setor, subsetor), "") if setor and subsetor else ""
-    if subsetor_leader and subsetor_leader != excluded_mat:
+    if subsetor_leader and subsetor_leader not in ignored:
         return subsetor_leader
     sector_leader = sector_leaders.get(setor, "") if setor else ""
-    if sector_leader and sector_leader != excluded_mat:
+    if sector_leader and sector_leader not in ignored:
         return sector_leader
     return ""
 
@@ -1567,6 +1571,7 @@ def redistribute_collaborator_leaders_in_frame(
         for value in (only_current_leaders or set())
         if str(value).strip()
     }
+    ignored_leaders = current_leader_filter if current_leader_filter else set()
     updates = 0
     for idx, row in result.iterrows():
         current_leader = str(row.get("LIDER", "")).strip()
@@ -1579,6 +1584,7 @@ def redistribute_collaborator_leaders_in_frame(
             mat,
             subsetor_leaders,
             sector_leaders,
+            ignored_mats=ignored_leaders,
         )
         if new_leader and new_leader != current_leader:
             result.at[idx, "LIDER"] = new_leader
@@ -1610,13 +1616,15 @@ def out_of_area_leader_ids(
         setor = str(row.get("SETOR", "")).strip()
         subsetor = str(row.get("SUBSETOR", "")).strip()
         mat = str(row.get("MAT", "")).strip()
-        expected_leader = org_leader_mat_for(setor, subsetor, mat, subsetor_leaders, sector_leaders)
-        if expected_leader and leader_mat == expected_leader:
-            continue
         if leader_area is None:
             invalid.add(leader_mat)
             continue
         leader_setor, leader_subsetor = leader_area
+        expected_leader = org_leader_mat_for(setor, subsetor, mat, subsetor_leaders, sector_leaders)
+        if expected_leader and leader_mat == expected_leader:
+            if subsetor and leader_subsetor and leader_subsetor != subsetor:
+                invalid.add(leader_mat)
+            continue
         if setor and leader_setor and leader_setor != setor:
             invalid.add(leader_mat)
             continue
