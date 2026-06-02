@@ -1485,6 +1485,192 @@ def subsetores_by_setor(subsetores_df: pd.DataFrame, df: pd.DataFrame) -> dict[s
     return {setor: sorted(values, key=str.casefold) for setor, values in mapping.items()}
 
 
+def clean_org_frame(frame: pd.DataFrame | None, columns: list[str]) -> pd.DataFrame:
+    clean = frame.copy() if frame is not None else pd.DataFrame(columns=columns)
+    for col in columns:
+        if col not in clean.columns:
+            clean[col] = ""
+        clean[col] = clean[col].fillna("").astype(str).str.strip()
+    return clean
+
+
+def build_org_leader_lookup(
+    df: pd.DataFrame,
+    setores_df: pd.DataFrame | None,
+    subsetores_df: pd.DataFrame | None,
+) -> tuple[dict[tuple[str, str], str], dict[str, str]]:
+    collaborators = clean_org_frame(df, COLLABORATOR_COLUMNS)
+    setores = clean_org_frame(setores_df, ["SETOR", "LIDERMAT"])
+    subsetores = clean_org_frame(subsetores_df, ["SUBSETOR", "SETORPAI", "LIDERMAT"])
+
+    collaborator_area = {
+        str(row.get("MAT", "")).strip(): (
+            str(row.get("SETOR", "")).strip(),
+            str(row.get("SUBSETOR", "")).strip(),
+        )
+        for _, row in collaborators.iterrows()
+        if str(row.get("MAT", "")).strip()
+    }
+
+    sector_leaders: dict[str, str] = {}
+    for _, row in setores.iterrows():
+        setor = str(row.get("SETOR", "")).strip()
+        leader_mat = str(row.get("LIDERMAT", "")).strip()
+        leader_area = collaborator_area.get(leader_mat)
+        if setor and leader_mat and leader_area:
+            sector_leaders[setor] = leader_mat
+
+    subsetor_leaders: dict[tuple[str, str], str] = {}
+    for _, row in subsetores.iterrows():
+        setor = str(row.get("SETORPAI", "")).strip()
+        subsetor = str(row.get("SUBSETOR", "")).strip()
+        leader_mat = str(row.get("LIDERMAT", "")).strip()
+        leader_area = collaborator_area.get(leader_mat)
+        if setor and subsetor and leader_mat and leader_area == (setor, subsetor):
+            subsetor_leaders[(setor, subsetor)] = leader_mat
+
+    return subsetor_leaders, sector_leaders
+
+
+def org_leader_mat_for(
+    setor: str,
+    subsetor: str,
+    excluded_mat: str,
+    subsetor_leaders: dict[tuple[str, str], str],
+    sector_leaders: dict[str, str],
+) -> str:
+    setor = str(setor or "").strip()
+    subsetor = str(subsetor or "").strip()
+    excluded_mat = str(excluded_mat or "").strip()
+    subsetor_leader = subsetor_leaders.get((setor, subsetor), "") if setor and subsetor else ""
+    if subsetor_leader and subsetor_leader != excluded_mat:
+        return subsetor_leader
+    sector_leader = sector_leaders.get(setor, "") if setor else ""
+    if sector_leader and sector_leader != excluded_mat:
+        return sector_leader
+    return ""
+
+
+def redistribute_collaborator_leaders_in_frame(
+    df: pd.DataFrame,
+    setores_df: pd.DataFrame | None,
+    subsetores_df: pd.DataFrame | None,
+    only_current_leaders: set[str] | None = None,
+) -> tuple[pd.DataFrame, int]:
+    result = clean_org_frame(df, COLLABORATOR_COLUMNS)
+    subsetor_leaders, sector_leaders = build_org_leader_lookup(result, setores_df, subsetores_df)
+    if not subsetor_leaders and not sector_leaders:
+        return result, 0
+
+    current_leader_filter = {
+        str(value).strip()
+        for value in (only_current_leaders or set())
+        if str(value).strip()
+    }
+    updates = 0
+    for idx, row in result.iterrows():
+        current_leader = str(row.get("LIDER", "")).strip()
+        if current_leader_filter and current_leader not in current_leader_filter:
+            continue
+        mat = str(row.get("MAT", "")).strip()
+        new_leader = org_leader_mat_for(
+            str(row.get("SETOR", "")).strip(),
+            str(row.get("SUBSETOR", "")).strip(),
+            mat,
+            subsetor_leaders,
+            sector_leaders,
+        )
+        if new_leader and new_leader != current_leader:
+            result.at[idx, "LIDER"] = new_leader
+            updates += 1
+    return result, updates
+
+
+def out_of_area_leader_ids(
+    df: pd.DataFrame,
+    setores_df: pd.DataFrame | None = None,
+    subsetores_df: pd.DataFrame | None = None,
+) -> set[str]:
+    collaborators = clean_org_frame(df, COLLABORATOR_COLUMNS)
+    subsetor_leaders, sector_leaders = build_org_leader_lookup(collaborators, setores_df, subsetores_df)
+    area_by_mat = {
+        str(row.get("MAT", "")).strip(): (
+            str(row.get("SETOR", "")).strip(),
+            str(row.get("SUBSETOR", "")).strip(),
+        )
+        for _, row in collaborators.iterrows()
+        if str(row.get("MAT", "")).strip()
+    }
+    invalid: set[str] = set()
+    for _, row in collaborators.iterrows():
+        leader_mat = str(row.get("LIDER", "")).strip()
+        if not leader_mat:
+            continue
+        leader_area = area_by_mat.get(leader_mat)
+        setor = str(row.get("SETOR", "")).strip()
+        subsetor = str(row.get("SUBSETOR", "")).strip()
+        mat = str(row.get("MAT", "")).strip()
+        expected_leader = org_leader_mat_for(setor, subsetor, mat, subsetor_leaders, sector_leaders)
+        if expected_leader and leader_mat == expected_leader:
+            continue
+        if leader_area is None:
+            invalid.add(leader_mat)
+            continue
+        leader_setor, leader_subsetor = leader_area
+        if setor and leader_setor and leader_setor != setor:
+            invalid.add(leader_mat)
+            continue
+        if subsetor and leader_subsetor and leader_subsetor != subsetor:
+            invalid.add(leader_mat)
+    return invalid
+
+
+def redistribute_collaborator_leaders(
+    setores_df: pd.DataFrame,
+    subsetores_df: pd.DataFrame,
+    only_current_leaders: set[str] | None = None,
+    db_path: str | Path = DB_PATH,
+) -> tuple[int, list[str]]:
+    errors: list[str] = []
+    with connect_db(db_path) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT MAT, NOME, CARGO, SUPERSETOR, SETOR, SUBSETOR, LIDER, POSICAO, OBSERVACOES
+            FROM colaboradores
+            ORDER BY NOME COLLATE NOCASE, MAT
+            """,
+            conn,
+            dtype=str,
+        )
+        redistributed, updates = redistribute_collaborator_leaders_in_frame(
+            df,
+            setores_df,
+            subsetores_df,
+            only_current_leaders=only_current_leaders,
+        )
+        if updates:
+            for _, row in redistributed.iterrows():
+                mat = str(row.get("MAT", "")).strip()
+                if not mat:
+                    continue
+                conn.execute(
+                    """
+                    UPDATE colaboradores
+                    SET LIDER = ?, UPDATED_AT = CURRENT_TIMESTAMP
+                    WHERE MAT = ? AND COALESCE(LIDER, '') <> ?
+                    """,
+                    (str(row.get("LIDER", "")).strip(), mat, str(row.get("LIDER", "")).strip()),
+                )
+            conn.commit()
+
+    if updates and is_primary_db_path(db_path):
+        try:
+            export_collaborators_to_csv(db_path=db_path)
+        except Exception as exc:
+            errors.append(f"Lideres redistribuidos no banco, mas backup CSV falhou: {exc}")
+    return updates, errors
+
+
 def load_crud_changes_from_query() -> dict:
     raw = st.query_params.get("org_changes", "")
     if isinstance(raw, list):
@@ -1542,18 +1728,20 @@ def validate_collaborator_row(row: dict, valid_ids: set[str], allow_existing: bo
 def persist_crud_changes_to_db(changes: dict, db_path: str | Path = DB_PATH) -> list[str]:
     errors: list[str] = []
     wrote_changes = False
+    changed_leader_ids: set[str] = set()
     with connect_db(db_path) as conn:
-        existing_ids = {
-            str(row[0]).strip()
-            for row in conn.execute("SELECT MAT FROM colaboradores").fetchall()
-            if str(row[0]).strip()
-        }
+        existing_area_by_mat: dict[str, tuple[str, str]] = {}
+        for row in conn.execute("SELECT MAT, SETOR, SUBSETOR FROM colaboradores").fetchall():
+            existing_mat = str(row[0]).strip()
+            if existing_mat:
+                existing_area_by_mat[existing_mat] = (str(row[1] or "").strip(), str(row[2] or "").strip())
+        existing_ids = set(existing_area_by_mat)
 
         delete_ids = {str(value).strip() for value in changes.get("deletes", []) if str(value).strip()}
         for mat in delete_ids:
-            conn.execute("UPDATE colaboradores SET LIDER = '', UPDATED_AT = CURRENT_TIMESTAMP WHERE LIDER = ?", (mat,))
             conn.execute("DELETE FROM colaboradores WHERE MAT = ?", (mat,))
             existing_ids.discard(mat)
+            changed_leader_ids.add(mat)
             wrote_changes = True
 
         for _, details in (changes.get("upserts", {}) or {}).items():
@@ -1582,9 +1770,30 @@ def persist_crud_changes_to_db(changes: dict, db_path: str | Path = DB_PATH) -> 
                 """,
                 tuple(row[col] for col in COLLABORATOR_COLUMNS),
             )
+            previous_area = existing_area_by_mat.get(mat)
+            new_area = (row["SETOR"], row["SUBSETOR"])
             existing_ids.add(mat)
+            if previous_area and previous_area != new_area:
+                changed_leader_ids.add(mat)
             wrote_changes = True
         conn.commit()
+    if wrote_changes and changed_leader_ids:
+        try:
+            setores_df, _, subsetores_df = load_hierarchy_from_db(db_path=db_path)
+            _, redistribution_errors = redistribute_collaborator_leaders(
+                setores_df,
+                subsetores_df,
+                only_current_leaders=changed_leader_ids,
+                db_path=db_path,
+            )
+            errors.extend(redistribution_errors)
+        except Exception as exc:
+            errors.append(f"Alteracao salva, mas redistribuicao de liderados falhou: {exc}")
+        if delete_ids:
+            with connect_db(db_path) as conn:
+                for mat in delete_ids:
+                    conn.execute("UPDATE colaboradores SET LIDER = '', UPDATED_AT = CURRENT_TIMESTAMP WHERE LIDER = ?", (mat,))
+                conn.commit()
     if wrote_changes and is_primary_db_path(db_path):
         try:
             export_collaborators_to_csv(db_path=db_path)
@@ -1830,25 +2039,15 @@ def build_pyvis_network(
         for setor, values in subsetors_by_sector.items()
     }
 
-    sector_leaders: dict[str, dict[str, str]] = {}
-    if not setores_df.empty:
-        for _, row in setores_df.iterrows():
-            setor = str(row.get("SETOR", "")).strip()
-            lider_id = str(row.get("LIDERMAT", "")).strip()
-            if setor and lider_id:
-                sector_leaders[setor] = {"mat": lider_id, "nome": name_by_id.get(lider_id, lider_id)}
-
-    subsetor_leaders: dict[str, dict[str, str]] = {}
-    if not subsetores_df.empty:
-        for _, row in subsetores_df.iterrows():
-            setor = str(row.get("SETORPAI", "")).strip()
-            subsetor = str(row.get("SUBSETOR", "")).strip()
-            lider_id = str(row.get("LIDERMAT", "")).strip()
-            if setor and subsetor and lider_id:
-                subsetor_leaders[f"{setor}||{subsetor}"] = {
-                    "mat": lider_id,
-                    "nome": name_by_id.get(lider_id, lider_id),
-                }
+    valid_subsetor_leaders, valid_sector_leaders = build_org_leader_lookup(editor_source, setores_df, subsetores_df)
+    sector_leaders = {
+        setor: {"mat": lider_id, "nome": name_by_id.get(lider_id, lider_id)}
+        for setor, lider_id in valid_sector_leaders.items()
+    }
+    subsetor_leaders = {
+        f"{setor}||{subsetor}": {"mat": lider_id, "nome": name_by_id.get(lider_id, lider_id)}
+        for (setor, subsetor), lider_id in valid_subsetor_leaders.items()
+    }
 
     for _, row in work.iterrows():
         parent = row["LIDER"]
@@ -3820,27 +4019,10 @@ def render_collaborator_editor(
     )
     setor_to_supersetor = setor_supersetor_map(supersetores_df)
     subsetor_map = subsetores_by_setor(subsetores_df, df)
+    valid_subsetor_leaders, valid_sector_leaders = build_org_leader_lookup(df, setores_df, subsetores_df)
 
-    def org_leader_mat_for(setor: str, subsetor: str, excluded_mat: str = "") -> str:
-        setor = str(setor or "").strip()
-        subsetor = str(subsetor or "").strip()
-        excluded_mat = str(excluded_mat or "").strip()
-        if subsetor and not subsetores_df.empty:
-            matches = subsetores_df[
-                (subsetores_df["SETORPAI"].astype(str).str.strip() == setor)
-                & (subsetores_df["SUBSETOR"].astype(str).str.strip() == subsetor)
-            ]
-            for _, row in matches.iterrows():
-                leader_mat = str(row.get("LIDERMAT", "")).strip()
-                if leader_mat and leader_mat != excluded_mat:
-                    return leader_mat
-        if setor and not setores_df.empty:
-            matches = setores_df[setores_df["SETOR"].astype(str).str.strip() == setor]
-            for _, row in matches.iterrows():
-                leader_mat = str(row.get("LIDERMAT", "")).strip()
-                if leader_mat and leader_mat != excluded_mat:
-                    return leader_mat
-        return ""
+    def current_org_leader_mat_for(setor: str, subsetor: str, excluded_mat: str = "") -> str:
+        return org_leader_mat_for(setor, subsetor, excluded_mat, valid_subsetor_leaders, valid_sector_leaders)
 
     leader_options = [""] + [
         f"{str(row.get('NOME', '')).strip()} (MAT: {str(row.get('MAT', '')).strip()})"
@@ -3977,7 +4159,7 @@ def render_collaborator_editor(
 
         if save_clicked:
             final_mat = mat if mode == "edit" else str(input_mat).strip()
-            org_leader_mat = org_leader_mat_for(input_setor, input_subsetor, final_mat)
+            org_leader_mat = current_org_leader_mat_for(input_setor, input_subsetor, final_mat)
             payload = {
                 "mat": final_mat,
                 "nome": str(input_nome).strip(),
@@ -4900,6 +5082,9 @@ def main():
         st.session_state["horizontal_view"] = False
     if st.session_state.get("crud_errors"):
         st.error("Nao foi possivel salvar uma ou mais alteracoes: " + " | ".join(st.session_state["crud_errors"]))
+    if st.session_state.get("leader_redistribution_message"):
+        st.success(str(st.session_state["leader_redistribution_message"]))
+        del st.session_state["leader_redistribution_message"]
 
     sidebar_view = str(st.session_state.get("sidebar_view", "none"))
     if sidebar_view in {"ranking", "suggestions"}:
@@ -4942,7 +5127,7 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-    action_col1, action_col2, action_col3, action_col4, _ = st.columns([1.35, 1.7, 1.75, 1.35, 2.0])
+    action_col1, action_col2, action_col3, action_col4, action_col5 = st.columns([1.35, 1.7, 1.75, 1.75, 1.35])
     with action_col1:
         if st.button("Mostrar ranking de span", use_container_width=True):
             st.session_state["sidebar_view"] = "ranking"
@@ -4956,6 +5141,25 @@ def main():
             st.session_state["hierarchy_open"] = not bool(st.session_state.get("hierarchy_open"))
             st.rerun()
     with action_col4:
+        if st.button("Redistribuir liderados", use_container_width=True):
+            invalid_leaders = out_of_area_leader_ids(df, setores_df, subsetores_df)
+            updated, errors = redistribute_collaborator_leaders(
+                setores_df,
+                subsetores_df,
+                only_current_leaders=invalid_leaders,
+            ) if invalid_leaders else (0, [])
+            if errors:
+                st.session_state["crud_errors"] = errors
+            else:
+                if updated:
+                    message = f"{updated} liderado(s) redistribuido(s)."
+                elif invalid_leaders:
+                    message = "Nenhum liderado foi redistribuido; confira se ha lider de subsetor ou setor cadastrado."
+                else:
+                    message = "Nenhum liderado precisava de redistribuicao."
+                st.session_state["leader_redistribution_message"] = message
+            st.rerun()
+    with action_col5:
         if st.button(kalk_button_label(), use_container_width=True, key="open_kalk_bo_button"):
             st.session_state["kalk_bo_open"] = not bool(st.session_state.get("kalk_bo_open"))
             st.rerun()
