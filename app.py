@@ -19,9 +19,14 @@ BRAND_BLUE = "#14315E"
 BRAND_GREEN = "#2FD68B"
 BRAND_WHITE = "#FFFFFF"
 COLLABORATOR_COLUMNS = ["MAT", "NOME", "CARGO", "SUPERSETOR", "SETOR", "SUBSETOR", "LIDER", "POSICAO", "OBSERVACOES"]
-DB_PATH = Path("organograma.db")
-KALK_BO_LOGO_PATH = Path("assets/KALK_BO.png")
-KALK_BO_ICON_PATH = Path("assets/KALK_BO_icon.png")
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "organograma.db"
+COLLABORATORS_CSV_PATH = BASE_DIR / "organograma.csv"
+SETORES_CSV_PATH = BASE_DIR / "setores.csv"
+SUPERSETORES_CSV_PATH = BASE_DIR / "supersetor.csv"
+SUBSETORES_CSV_PATH = BASE_DIR / "subsetor.csv"
+KALK_BO_LOGO_PATH = BASE_DIR / "assets/KALK_BO.png"
+KALK_BO_ICON_PATH = BASE_DIR / "assets/KALK_BO_icon.png"
 KALK_STATUS_COLORS = {
     "pending": "#C8CED8",
     "green": "#15a979",
@@ -34,7 +39,7 @@ ORG_CHART_COMPONENT = st.components.v1.declare_component(
 )
 
 
-ICON_PATH = Path("assets/logoOrganograma.png")
+ICON_PATH = BASE_DIR / "assets/logoOrganograma.png"
 PAGE_ICON = Image.open(ICON_PATH) if ICON_PATH.exists() else None
 
 st.set_page_config(
@@ -370,6 +375,61 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+def app_data_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else BASE_DIR / candidate
+
+
+def is_primary_db_path(db_path: str | Path) -> bool:
+    return app_data_path(db_path).resolve() == DB_PATH.resolve()
+
+
+def connect_db(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
+    resolved = app_data_path(db_path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(resolved), timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = FULL")
+    return conn
+
+
+def atomic_write_dataframe_csv(df: pd.DataFrame, path: str | Path, columns: list[str]) -> None:
+    target = app_data_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    work = df.copy()
+    for col in columns:
+        if col not in work.columns:
+            work[col] = ""
+        work[col] = work[col].fillna("").astype(str).str.strip()
+    work = work[columns]
+
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            delete=False,
+            dir=str(target.parent),
+            suffix=".tmp",
+            encoding="utf-8",
+            newline="",
+        ) as handle:
+            temp_path = Path(handle.name)
+            work.to_csv(handle, index=False, sep=";")
+        temp_path.replace(target)
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+
+def export_collaborators_to_csv(
+    db_path: str | Path = DB_PATH,
+    csv_path: str | Path = COLLABORATORS_CSV_PATH,
+) -> None:
+    atomic_write_dataframe_csv(load_collaborators_from_db(db_path), csv_path, COLLABORATOR_COLUMNS)
+
+
 @st.cache_data
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, sep=";", dtype=str, keep_default_na=False)
@@ -390,8 +450,8 @@ def load_data(path: str) -> pd.DataFrame:
     return df.drop_duplicates(subset=["MAT"], keep="first").reset_index(drop=True)
 
 
-def init_collaborator_db(csv_path: str, db_path: Path = DB_PATH) -> None:
-    with sqlite3.connect(db_path) as conn:
+def init_collaborator_db(csv_path: str | Path, db_path: str | Path = DB_PATH) -> None:
+    with connect_db(db_path) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS colaboradores (
@@ -422,8 +482,8 @@ def init_collaborator_db(csv_path: str, db_path: Path = DB_PATH) -> None:
             seed.to_sql("colaboradores", conn, if_exists="append", index=False)
 
 
-def load_collaborators_from_db(db_path: Path = DB_PATH) -> pd.DataFrame:
-    with sqlite3.connect(db_path) as conn:
+def load_collaborators_from_db(db_path: str | Path = DB_PATH) -> pd.DataFrame:
+    with connect_db(db_path) as conn:
         df = pd.read_sql_query(
             """
             SELECT MAT, NOME, CARGO, SUPERSETOR, SETOR, SUBSETOR, LIDER, POSICAO, OBSERVACOES
@@ -497,12 +557,12 @@ def load_subsetores(path: str) -> pd.DataFrame:
 
 
 def init_hierarchy_db(
-    setores_path: str,
-    supersetores_path: str,
-    subsetores_path: str,
-    db_path: Path = DB_PATH,
+    setores_path: str | Path,
+    supersetores_path: str | Path,
+    subsetores_path: str | Path,
+    db_path: str | Path = DB_PATH,
 ) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with connect_db(db_path) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS hierarchy_setores (
@@ -574,12 +634,12 @@ def init_hierarchy_db(
 
 
 def load_hierarchy_from_db(
-    db_path: Path = DB_PATH,
-    setores_path: str = "setores.csv",
-    supersetores_path: str = "supersetor.csv",
-    subsetores_path: str = "subsetor.csv",
+    db_path: str | Path = DB_PATH,
+    setores_path: str | Path = SETORES_CSV_PATH,
+    supersetores_path: str | Path = SUPERSETORES_CSV_PATH,
+    subsetores_path: str | Path = SUBSETORES_CSV_PATH,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    with sqlite3.connect(db_path) as conn:
+    with connect_db(db_path) as conn:
         setores_df = pd.read_sql_query(
             """
             SELECT SETOR, LIDERMAT, rowid AS _ROWID
@@ -622,7 +682,7 @@ def load_hierarchy_from_db(
                 frame[col] = ""
             frame[col] = frame[col].fillna("").astype(str).str.strip()
 
-    def reference_order(path: str, key_columns: list[str]) -> dict[tuple[str, ...], int]:
+    def reference_order(path: str | Path, key_columns: list[str]) -> dict[tuple[str, ...], int]:
         try:
             reference = pd.read_csv(path, sep=";", dtype=str, keep_default_na=False)
             reference.columns = [c.strip().upper() for c in reference.columns]
@@ -635,7 +695,7 @@ def load_hierarchy_from_db(
                 order[key] = int(idx)
         return order
 
-    def sort_with_reference(frame: pd.DataFrame, key_columns: list[str], path: str) -> pd.DataFrame:
+    def sort_with_reference(frame: pd.DataFrame, key_columns: list[str], path: str | Path) -> pd.DataFrame:
         order = reference_order(path, key_columns)
         work = frame.copy()
 
@@ -656,7 +716,11 @@ def load_hierarchy_from_db(
     return setores_df, supersetores_df, subsetores_df
 
 
-def persist_hierarchy_setores(setores_df: pd.DataFrame, db_path: Path = DB_PATH) -> None:
+def persist_hierarchy_setores(
+    setores_df: pd.DataFrame,
+    db_path: str | Path = DB_PATH,
+    csv_path: str | Path = SETORES_CSV_PATH,
+) -> None:
     clean = setores_df.copy()
     for col in ["SETOR", "LIDERMAT"]:
         if col not in clean.columns:
@@ -664,7 +728,7 @@ def persist_hierarchy_setores(setores_df: pd.DataFrame, db_path: Path = DB_PATH)
         clean[col] = clean[col].fillna("").astype(str).str.strip()
     clean = clean[clean["SETOR"] != ""].drop_duplicates(subset=["SETOR"], keep="last")
 
-    with sqlite3.connect(db_path) as conn:
+    with connect_db(db_path) as conn:
         conn.execute("DELETE FROM hierarchy_setores")
         for _, row in clean.iterrows():
             conn.execute(
@@ -675,9 +739,15 @@ def persist_hierarchy_setores(setores_df: pd.DataFrame, db_path: Path = DB_PATH)
                 (row["SETOR"], row["LIDERMAT"]),
             )
         conn.commit()
+    if is_primary_db_path(db_path):
+        atomic_write_dataframe_csv(clean, csv_path, ["SETOR", "LIDERMAT"])
 
 
-def persist_hierarchy_supersetores(supersetores_df: pd.DataFrame, db_path: Path = DB_PATH) -> None:
+def persist_hierarchy_supersetores(
+    supersetores_df: pd.DataFrame,
+    db_path: str | Path = DB_PATH,
+    csv_path: str | Path = SUPERSETORES_CSV_PATH,
+) -> None:
     clean = supersetores_df.copy()
     for col in ["SUPERSETOR", "SETORFILHO", "LIDERMAT"]:
         if col not in clean.columns:
@@ -686,7 +756,7 @@ def persist_hierarchy_supersetores(supersetores_df: pd.DataFrame, db_path: Path 
     clean = clean[(clean["SUPERSETOR"] != "") & (clean["SETORFILHO"] != "")]
     clean = clean.drop_duplicates(subset=["SETORFILHO"], keep="last")
 
-    with sqlite3.connect(db_path) as conn:
+    with connect_db(db_path) as conn:
         conn.execute("DELETE FROM hierarchy_supersetores")
         for _, row in clean.iterrows():
             conn.execute(
@@ -697,9 +767,15 @@ def persist_hierarchy_supersetores(supersetores_df: pd.DataFrame, db_path: Path 
                 (row["SUPERSETOR"], row["SETORFILHO"], row["LIDERMAT"]),
             )
         conn.commit()
+    if is_primary_db_path(db_path):
+        atomic_write_dataframe_csv(clean, csv_path, ["SUPERSETOR", "SETORFILHO", "LIDERMAT"])
 
 
-def persist_hierarchy_subsetores(subsetores_df: pd.DataFrame, db_path: Path = DB_PATH) -> None:
+def persist_hierarchy_subsetores(
+    subsetores_df: pd.DataFrame,
+    db_path: str | Path = DB_PATH,
+    csv_path: str | Path = SUBSETORES_CSV_PATH,
+) -> None:
     clean = subsetores_df.copy()
     for col in ["SUBSETOR", "SETORPAI", "LIDERMAT"]:
         if col not in clean.columns:
@@ -708,7 +784,7 @@ def persist_hierarchy_subsetores(subsetores_df: pd.DataFrame, db_path: Path = DB
     clean = clean[(clean["SUBSETOR"] != "") & (clean["SETORPAI"] != "")]
     clean = clean.drop_duplicates(subset=["SUBSETOR"], keep="last")
 
-    with sqlite3.connect(db_path) as conn:
+    with connect_db(db_path) as conn:
         conn.execute("DELETE FROM hierarchy_subsetores")
         for _, row in clean.iterrows():
             conn.execute(
@@ -719,10 +795,12 @@ def persist_hierarchy_subsetores(subsetores_df: pd.DataFrame, db_path: Path = DB
                 (row["SUBSETOR"], row["SETORPAI"], row["LIDERMAT"]),
             )
         conn.commit()
+    if is_primary_db_path(db_path):
+        atomic_write_dataframe_csv(clean, csv_path, ["SUBSETOR", "SETORPAI", "LIDERMAT"])
 
 
 def init_kalk_bo_db(db_path: Path = DB_PATH) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with connect_db(db_path) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS kalk_bo_configs (
@@ -775,7 +853,7 @@ def default_kalk_config(scope_type: str, setor: str, subsetor: str = "") -> dict
 
 
 def load_kalk_bo_configs(db_path: Path = DB_PATH) -> dict[tuple[str, str], dict]:
-    with sqlite3.connect(db_path) as conn:
+    with connect_db(db_path) as conn:
         df = pd.read_sql_query(
             """
             SELECT SCOPE_TYPE, SCOPE_KEY, SETOR, SUBSETOR, DRIVER_LABEL, INDICATOR_LABEL,
@@ -794,7 +872,7 @@ def load_kalk_bo_configs(db_path: Path = DB_PATH) -> dict[tuple[str, str], dict]
 
 
 def load_kalk_bo_values(db_path: Path = DB_PATH) -> pd.DataFrame:
-    with sqlite3.connect(db_path) as conn:
+    with connect_db(db_path) as conn:
         df = pd.read_sql_query(
             """
             SELECT SCOPE_TYPE, SCOPE_KEY, MAT, DRIVER_VALUE, INDICATOR_VALUE
@@ -811,7 +889,7 @@ def load_kalk_bo_values(db_path: Path = DB_PATH) -> pd.DataFrame:
 
 
 def persist_kalk_bo_config(config: dict, db_path: Path = DB_PATH) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with connect_db(db_path) as conn:
         conn.execute(
             """
             INSERT INTO kalk_bo_configs (
@@ -859,7 +937,7 @@ def parse_optional_float(value) -> float | None:
 def persist_kalk_bo_values(scope_type: str, scope_key: str, edited_df: pd.DataFrame, db_path: Path = DB_PATH) -> None:
     scope_type = str(scope_type or "").strip()
     scope_key = str(scope_key or "").strip()
-    with sqlite3.connect(db_path) as conn:
+    with connect_db(db_path) as conn:
         conn.execute(
             "DELETE FROM kalk_bo_values WHERE SCOPE_TYPE = ? AND SCOPE_KEY = ?",
             (scope_type, scope_key),
@@ -1461,9 +1539,10 @@ def validate_collaborator_row(row: dict, valid_ids: set[str], allow_existing: bo
     return ""
 
 
-def persist_crud_changes_to_db(changes: dict, db_path: Path = DB_PATH) -> list[str]:
+def persist_crud_changes_to_db(changes: dict, db_path: str | Path = DB_PATH) -> list[str]:
     errors: list[str] = []
-    with sqlite3.connect(db_path) as conn:
+    wrote_changes = False
+    with connect_db(db_path) as conn:
         existing_ids = {
             str(row[0]).strip()
             for row in conn.execute("SELECT MAT FROM colaboradores").fetchall()
@@ -1475,6 +1554,7 @@ def persist_crud_changes_to_db(changes: dict, db_path: Path = DB_PATH) -> list[s
             conn.execute("UPDATE colaboradores SET LIDER = '', UPDATED_AT = CURRENT_TIMESTAMP WHERE LIDER = ?", (mat,))
             conn.execute("DELETE FROM colaboradores WHERE MAT = ?", (mat,))
             existing_ids.discard(mat)
+            wrote_changes = True
 
         for _, details in (changes.get("upserts", {}) or {}).items():
             if not isinstance(details, dict):
@@ -1503,11 +1583,17 @@ def persist_crud_changes_to_db(changes: dict, db_path: Path = DB_PATH) -> list[s
                 tuple(row[col] for col in COLLABORATOR_COLUMNS),
             )
             existing_ids.add(mat)
+            wrote_changes = True
         conn.commit()
+    if wrote_changes and is_primary_db_path(db_path):
+        try:
+            export_collaborators_to_csv(db_path=db_path)
+        except Exception as exc:
+            errors.append(f"Alteracao salva no banco, mas backup CSV falhou: {exc}")
     return errors
 
 
-def consume_crud_query(db_path: Path = DB_PATH) -> None:
+def consume_crud_query(db_path: str | Path = DB_PATH) -> None:
     changes = load_crud_changes_from_query()
     if not changes.get("upserts") and not changes.get("deletes"):
         return
@@ -3036,12 +3122,13 @@ def render_pyvis(
             return mapping[setor] || '';
         }
 
-        function leaderForOrg(setor, subsetor) {
+        function leaderForOrg(setor, subsetor, excludedMat) {
+            const excluded = String(excludedMat || '').trim();
             const subsetorKey = String(setor || '') + '||' + String(subsetor || '');
             const subsetorLeader = (editorData.lideresSubsetor || {})[subsetorKey];
-            if (subsetorLeader && subsetorLeader.mat) return subsetorLeader;
+            if (subsetorLeader && subsetorLeader.mat && String(subsetorLeader.mat) !== excluded) return subsetorLeader;
             const sectorLeader = (editorData.lideresSetor || {})[setor || ''];
-            if (sectorLeader && sectorLeader.mat) return sectorLeader;
+            if (sectorLeader && sectorLeader.mat && String(sectorLeader.mat) !== excluded) return sectorLeader;
             return { mat: '', nome: '' };
         }
 
@@ -3380,10 +3467,8 @@ def render_pyvis(
                 const subsetor = getInput('subsetor');
                 if (field('subsetor')) field('subsetor').innerHTML = subsetorOptionsForSetor(setor, subsetor);
                 setInput('supersetor', supersetorForSetor(setor));
-                if (currentMode === 'create') {
-                    const leader = leaderForOrg(setor, getInput('subsetor'));
-                    if (leader.mat) setInput('liderMat', leader.mat);
-                }
+                const leader = leaderForOrg(setor, getInput('subsetor'), getInput('mat'));
+                if (leader.mat) setInput('liderMat', leader.mat);
             }
 
             function refreshPosicaoFromCargoNivel() {
@@ -3455,9 +3540,10 @@ def render_pyvis(
                 const subsetor = getInput('subsetor');
                 const cargoBase = getInput('cargo');
                 const nivel = getInput('nivel');
-                const leader = leaderForOrg(setor, subsetor);
+                const leader = leaderForOrg(setor, subsetor, mat);
                 const existingNode = currentNodeId && getNodesDataset() ? getNodesDataset().get(currentNodeId) : null;
                 const existing = existingNode && existingNode.collaborator ? existingNode.collaborator : {};
+                const leaderMat = leader.mat || getInput('liderMat') || existing.liderMat || '';
                 return Object.assign({}, existing, {
                     mat: mat,
                     nome: getInput('nome'),
@@ -3467,8 +3553,8 @@ def render_pyvis(
                     setor: setor,
                     subsetor: subsetor,
                     supersetor: getInput('supersetor') || supersetorForSetor(setor),
-                    liderMat: currentMode === 'create' ? getInput('liderMat') : (existing.liderMat || leader.mat || ''),
-                    lider: currentMode === 'create' ? '' : (existing.lider || leader.nome || ''),
+                    liderMat: leaderMat,
+                    lider: leader.nome || (leaderMat === existing.liderMat ? existing.lider : ''),
                     posicao: getInput('posicao'),
                     observacoes: getInput('observacoes'),
                     span: Number(existing.span || 0)
@@ -3692,7 +3778,7 @@ def request_sidebar_open() -> None:
 
 
 def render_brand_header() -> None:
-    logo_path = Path("assets/logoOrganograma.png")
+    logo_path = ICON_PATH
     logo_html = ""
     if logo_path.exists():
         logo_bytes = logo_path.read_bytes()
@@ -3734,6 +3820,27 @@ def render_collaborator_editor(
     )
     setor_to_supersetor = setor_supersetor_map(supersetores_df)
     subsetor_map = subsetores_by_setor(subsetores_df, df)
+
+    def org_leader_mat_for(setor: str, subsetor: str, excluded_mat: str = "") -> str:
+        setor = str(setor or "").strip()
+        subsetor = str(subsetor or "").strip()
+        excluded_mat = str(excluded_mat or "").strip()
+        if subsetor and not subsetores_df.empty:
+            matches = subsetores_df[
+                (subsetores_df["SETORPAI"].astype(str).str.strip() == setor)
+                & (subsetores_df["SUBSETOR"].astype(str).str.strip() == subsetor)
+            ]
+            for _, row in matches.iterrows():
+                leader_mat = str(row.get("LIDERMAT", "")).strip()
+                if leader_mat and leader_mat != excluded_mat:
+                    return leader_mat
+        if setor and not setores_df.empty:
+            matches = setores_df[setores_df["SETOR"].astype(str).str.strip() == setor]
+            for _, row in matches.iterrows():
+                leader_mat = str(row.get("LIDERMAT", "")).strip()
+                if leader_mat and leader_mat != excluded_mat:
+                    return leader_mat
+        return ""
 
     leader_options = [""] + [
         f"{str(row.get('NOME', '')).strip()} (MAT: {str(row.get('MAT', '')).strip()})"
@@ -3870,6 +3977,7 @@ def render_collaborator_editor(
 
         if save_clicked:
             final_mat = mat if mode == "edit" else str(input_mat).strip()
+            org_leader_mat = org_leader_mat_for(input_setor, input_subsetor, final_mat)
             payload = {
                 "mat": final_mat,
                 "nome": str(input_nome).strip(),
@@ -3877,7 +3985,7 @@ def render_collaborator_editor(
                 "supersetor": setor_to_supersetor.get(str(input_setor).strip(), current_supersetor),
                 "setor": str(input_setor).strip(),
                 "subsetor": str(input_subsetor).strip(),
-                "liderMat": leader_by_label.get(input_lider_label, ""),
+                "liderMat": org_leader_mat or leader_by_label.get(input_lider_label, ""),
                 "posicao": str(input_posicao).strip(),
                 "observacoes": str(input_observacoes).strip(),
             }
@@ -4749,10 +4857,10 @@ def render_hierarchy_manager(
 def main():
     render_brand_header()
 
-    path = "organograma.csv"
-    setores_path = "setores.csv"
-    supersetores_path = "supersetor.csv"
-    subsetores_path = "subsetor.csv"
+    path = COLLABORATORS_CSV_PATH
+    setores_path = SETORES_CSV_PATH
+    supersetores_path = SUPERSETORES_CSV_PATH
+    subsetores_path = SUBSETORES_CSV_PATH
     
     try:
         init_collaborator_db(path)
