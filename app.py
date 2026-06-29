@@ -2,6 +2,7 @@
 import json
 import base64
 import html
+import os
 import sqlite3
 import statistics
 import urllib.parse
@@ -27,6 +28,41 @@ SUPERSETORES_CSV_PATH = BASE_DIR / "supersetor.csv"
 SUBSETORES_CSV_PATH = BASE_DIR / "subsetor.csv"
 KALK_BO_LOGO_PATH = BASE_DIR / "assets/KALK_BO.png"
 KALK_BO_ICON_PATH = BASE_DIR / "assets/KALK_BO_icon.png"
+SUPABASE_COLLABORATOR_COLUMNS = {
+    "MAT": "mat",
+    "NOME": "nome",
+    "CARGO": "cargo",
+    "SUPERSETOR": "supersetor",
+    "SETOR": "setor",
+    "SUBSETOR": "subsetor",
+    "LIDER": "lider",
+    "POSICAO": "posicao",
+    "OBSERVACOES": "observacoes",
+}
+SUPABASE_HIERARCHY_SETOR_COLUMNS = {"SETOR": "setor", "LIDERMAT": "lidermat"}
+SUPABASE_HIERARCHY_SUPERSETOR_COLUMNS = {
+    "SUPERSETOR": "supersetor",
+    "SETORFILHO": "setorfilho",
+    "LIDERMAT": "lidermat",
+}
+SUPABASE_HIERARCHY_SUBSETOR_COLUMNS = {"SUBSETOR": "subsetor", "SETORPAI": "setorpai", "LIDERMAT": "lidermat"}
+SUPABASE_KALK_CONFIG_COLUMNS = {
+    "SCOPE_TYPE": "scope_type",
+    "SCOPE_KEY": "scope_key",
+    "SETOR": "setor",
+    "SUBSETOR": "subsetor",
+    "DRIVER_LABEL": "driver_label",
+    "INDICATOR_LABEL": "indicator_label",
+    "YELLOW_MIN": "yellow_min",
+    "GREEN_MIN": "green_min",
+}
+SUPABASE_KALK_VALUE_COLUMNS = {
+    "SCOPE_TYPE": "scope_type",
+    "SCOPE_KEY": "scope_key",
+    "MAT": "mat",
+    "DRIVER_VALUE": "driver_value",
+    "INDICATOR_VALUE": "indicator_value",
+}
 KALK_STATUS_COLORS = {
     "pending": "#C8CED8",
     "green": "#15a979",
@@ -381,6 +417,94 @@ def app_data_path(path: str | Path) -> Path:
     return candidate if candidate.is_absolute() else BASE_DIR / candidate
 
 
+def secret_or_env(name: str, default: str = "") -> str:
+    value = os.getenv(name, "")
+    if value:
+        return value
+    try:
+        raw = st.secrets.get(name, default)
+    except Exception:
+        raw = default
+    return str(raw or default).strip()
+
+
+def supabase_credentials() -> tuple[str, str]:
+    url = secret_or_env("SUPABASE_URL")
+    key = secret_or_env("SUPABASE_SERVICE_ROLE_KEY")
+    return url, key
+
+
+def supabase_enabled() -> bool:
+    url, key = supabase_credentials()
+    return bool(url and key)
+
+
+@st.cache_resource(show_spinner=False)
+def cached_supabase_client(url: str, key: str):
+    from supabase import create_client
+
+    return create_client(url, key)
+
+
+def supabase_client():
+    url, key = supabase_credentials()
+    if not url or not key:
+        raise RuntimeError("Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY para usar Supabase.")
+    return cached_supabase_client(url, key)
+
+
+def supabase_execute(query):
+    response = query.execute()
+    return getattr(response, "data", None) or []
+
+
+def supabase_fetch_all(table: str, order_columns: list[str] | None = None) -> list[dict]:
+    client = supabase_client()
+    rows: list[dict] = []
+    offset = 0
+    page_size = 1000
+    while True:
+        query = client.table(table).select("*")
+        for column in order_columns or []:
+            query = query.order(column)
+        batch = supabase_execute(query.range(offset, offset + page_size - 1))
+        rows.extend(batch)
+        if len(batch) < page_size:
+            return rows
+        offset += page_size
+
+
+def supabase_rows_to_frame(rows: list[dict], columns: list[str], mapping: dict[str, str]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.rename(columns={db_col: app_col for app_col, db_col in mapping.items()})
+    for col in columns:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    return df[columns].reset_index(drop=True)
+
+
+def supabase_text_row(row: dict | pd.Series, columns: list[str], mapping: dict[str, str]) -> dict:
+    return {
+        mapping[col]: str(row.get(col, "") or "").strip()
+        for col in columns
+        if col in mapping
+    }
+
+
+def supabase_insert_batches(table: str, rows: list[dict], batch_size: int = 500) -> None:
+    if not rows:
+        return
+    client = supabase_client()
+    for start in range(0, len(rows), batch_size):
+        supabase_execute(client.table(table).insert(rows[start : start + batch_size]))
+
+
+def supabase_delete_all(table: str, filter_column: str = "sort_order") -> None:
+    supabase_execute(supabase_client().table(table).delete().gte(filter_column, 0))
+
+
 def is_primary_db_path(db_path: str | Path) -> bool:
     return app_data_path(db_path).resolve() == DB_PATH.resolve()
 
@@ -451,6 +575,9 @@ def load_data(path: str) -> pd.DataFrame:
 
 
 def init_collaborator_db(csv_path: str | Path, db_path: str | Path = DB_PATH) -> None:
+    if supabase_enabled():
+        supabase_fetch_all("colaboradores", ["nome", "mat"])
+        return
     with connect_db(db_path) as conn:
         conn.execute(
             """
@@ -483,6 +610,10 @@ def init_collaborator_db(csv_path: str | Path, db_path: str | Path = DB_PATH) ->
 
 
 def load_collaborators_from_db(db_path: str | Path = DB_PATH) -> pd.DataFrame:
+    if supabase_enabled():
+        rows = supabase_fetch_all("colaboradores", ["nome", "mat"])
+        df = supabase_rows_to_frame(rows, COLLABORATOR_COLUMNS, SUPABASE_COLLABORATOR_COLUMNS)
+        return df.drop_duplicates(subset=["MAT"], keep="last").reset_index(drop=True)
     with connect_db(db_path) as conn:
         df = pd.read_sql_query(
             """
@@ -562,6 +693,11 @@ def init_hierarchy_db(
     subsetores_path: str | Path,
     db_path: str | Path = DB_PATH,
 ) -> None:
+    if supabase_enabled():
+        supabase_fetch_all("hierarchy_setores", ["sort_order", "setor"])
+        supabase_fetch_all("hierarchy_supersetores", ["sort_order", "supersetor", "setorfilho"])
+        supabase_fetch_all("hierarchy_subsetores", ["sort_order", "setorpai", "subsetor"])
+        return
     with connect_db(db_path) as conn:
         conn.execute(
             """
@@ -639,6 +775,22 @@ def load_hierarchy_from_db(
     supersetores_path: str | Path = SUPERSETORES_CSV_PATH,
     subsetores_path: str | Path = SUBSETORES_CSV_PATH,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if supabase_enabled():
+        setores_rows = supabase_fetch_all("hierarchy_setores", ["sort_order", "setor"])
+        supersetores_rows = supabase_fetch_all("hierarchy_supersetores", ["sort_order", "supersetor", "setorfilho"])
+        subsetores_rows = supabase_fetch_all("hierarchy_subsetores", ["sort_order", "setorpai", "subsetor"])
+        setores_df = supabase_rows_to_frame(setores_rows, ["SETOR", "LIDERMAT"], SUPABASE_HIERARCHY_SETOR_COLUMNS)
+        supersetores_df = supabase_rows_to_frame(
+            supersetores_rows,
+            ["SUPERSETOR", "SETORFILHO", "LIDERMAT"],
+            SUPABASE_HIERARCHY_SUPERSETOR_COLUMNS,
+        )
+        subsetores_df = supabase_rows_to_frame(
+            subsetores_rows,
+            ["SUBSETOR", "SETORPAI", "LIDERMAT"],
+            SUPABASE_HIERARCHY_SUBSETOR_COLUMNS,
+        )
+        return setores_df, supersetores_df, subsetores_df
     with connect_db(db_path) as conn:
         setores_df = pd.read_sql_query(
             """
@@ -728,6 +880,16 @@ def persist_hierarchy_setores(
         clean[col] = clean[col].fillna("").astype(str).str.strip()
     clean = clean[clean["SETOR"] != ""].drop_duplicates(subset=["SETOR"], keep="last")
 
+    if supabase_enabled():
+        supabase_delete_all("hierarchy_setores")
+        rows = []
+        for idx, row in clean.reset_index(drop=True).iterrows():
+            payload = supabase_text_row(row, ["SETOR", "LIDERMAT"], SUPABASE_HIERARCHY_SETOR_COLUMNS)
+            payload["sort_order"] = int(idx)
+            rows.append(payload)
+        supabase_insert_batches("hierarchy_setores", rows)
+        return
+
     with connect_db(db_path) as conn:
         conn.execute("DELETE FROM hierarchy_setores")
         for _, row in clean.iterrows():
@@ -755,6 +917,20 @@ def persist_hierarchy_supersetores(
         clean[col] = clean[col].fillna("").astype(str).str.strip()
     clean = clean[(clean["SUPERSETOR"] != "") & (clean["SETORFILHO"] != "")]
     clean = clean.drop_duplicates(subset=["SETORFILHO"], keep="last")
+
+    if supabase_enabled():
+        supabase_delete_all("hierarchy_supersetores")
+        rows = []
+        for idx, row in clean.reset_index(drop=True).iterrows():
+            payload = supabase_text_row(
+                row,
+                ["SUPERSETOR", "SETORFILHO", "LIDERMAT"],
+                SUPABASE_HIERARCHY_SUPERSETOR_COLUMNS,
+            )
+            payload["sort_order"] = int(idx)
+            rows.append(payload)
+        supabase_insert_batches("hierarchy_supersetores", rows)
+        return
 
     with connect_db(db_path) as conn:
         conn.execute("DELETE FROM hierarchy_supersetores")
@@ -784,6 +960,20 @@ def persist_hierarchy_subsetores(
     clean = clean[(clean["SUBSETOR"] != "") & (clean["SETORPAI"] != "")]
     clean = clean.drop_duplicates(subset=["SUBSETOR"], keep="last")
 
+    if supabase_enabled():
+        supabase_delete_all("hierarchy_subsetores")
+        rows = []
+        for idx, row in clean.reset_index(drop=True).iterrows():
+            payload = supabase_text_row(
+                row,
+                ["SUBSETOR", "SETORPAI", "LIDERMAT"],
+                SUPABASE_HIERARCHY_SUBSETOR_COLUMNS,
+            )
+            payload["sort_order"] = int(idx)
+            rows.append(payload)
+        supabase_insert_batches("hierarchy_subsetores", rows)
+        return
+
     with connect_db(db_path) as conn:
         conn.execute("DELETE FROM hierarchy_subsetores")
         for _, row in clean.iterrows():
@@ -800,6 +990,10 @@ def persist_hierarchy_subsetores(
 
 
 def init_kalk_bo_db(db_path: Path = DB_PATH) -> None:
+    if supabase_enabled():
+        supabase_fetch_all("kalk_bo_configs", ["scope_type", "scope_key"])
+        supabase_fetch_all("kalk_bo_values", ["scope_type", "scope_key", "mat"])
+        return
     with connect_db(db_path) as conn:
         conn.execute(
             """
@@ -853,6 +1047,25 @@ def default_kalk_config(scope_type: str, setor: str, subsetor: str = "") -> dict
 
 
 def load_kalk_bo_configs(db_path: Path = DB_PATH) -> dict[tuple[str, str], dict]:
+    if supabase_enabled():
+        rows = supabase_fetch_all("kalk_bo_configs", ["scope_type", "scope_key"])
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.rename(columns={db_col: app_col for app_col, db_col in SUPABASE_KALK_CONFIG_COLUMNS.items()})
+        for col in SUPABASE_KALK_CONFIG_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        for col in ["SCOPE_TYPE", "SCOPE_KEY", "SETOR", "SUBSETOR", "DRIVER_LABEL", "INDICATOR_LABEL"]:
+            df[col] = df[col].fillna("").astype(str).str.strip()
+        for col, default in [("YELLOW_MIN", 3.5), ("GREEN_MIN", 4.5)]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(default)
+        configs: dict[tuple[str, str], dict] = {}
+        for _, row in df.iterrows():
+            scope_type = str(row.get("SCOPE_TYPE", "")).strip()
+            scope_key = str(row.get("SCOPE_KEY", "")).strip()
+            if scope_type and scope_key:
+                configs[(scope_type, scope_key)] = row.to_dict()
+        return configs
     with connect_db(db_path) as conn:
         df = pd.read_sql_query(
             """
@@ -872,6 +1085,19 @@ def load_kalk_bo_configs(db_path: Path = DB_PATH) -> dict[tuple[str, str], dict]
 
 
 def load_kalk_bo_values(db_path: Path = DB_PATH) -> pd.DataFrame:
+    if supabase_enabled():
+        rows = supabase_fetch_all("kalk_bo_values", ["scope_type", "scope_key", "mat"])
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.rename(columns={db_col: app_col for app_col, db_col in SUPABASE_KALK_VALUE_COLUMNS.items()})
+        for col in SUPABASE_KALK_VALUE_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        for col in ["SCOPE_TYPE", "SCOPE_KEY", "MAT"]:
+            df[col] = df[col].fillna("").astype(str).str.strip()
+        for col in ["DRIVER_VALUE", "INDICATOR_VALUE"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df[["SCOPE_TYPE", "SCOPE_KEY", "MAT", "DRIVER_VALUE", "INDICATOR_VALUE"]]
     with connect_db(db_path) as conn:
         df = pd.read_sql_query(
             """
@@ -889,6 +1115,19 @@ def load_kalk_bo_values(db_path: Path = DB_PATH) -> pd.DataFrame:
 
 
 def persist_kalk_bo_config(config: dict, db_path: Path = DB_PATH) -> None:
+    if supabase_enabled():
+        payload = {
+            "scope_type": str(config.get("SCOPE_TYPE", "")).strip(),
+            "scope_key": str(config.get("SCOPE_KEY", "")).strip(),
+            "setor": str(config.get("SETOR", "")).strip(),
+            "subsetor": str(config.get("SUBSETOR", "")).strip(),
+            "driver_label": str(config.get("DRIVER_LABEL", "")).strip(),
+            "indicator_label": str(config.get("INDICATOR_LABEL", "")).strip(),
+            "yellow_min": float(config.get("YELLOW_MIN", 3.5) or 3.5),
+            "green_min": float(config.get("GREEN_MIN", 4.5) or 4.5),
+        }
+        supabase_execute(supabase_client().table("kalk_bo_configs").upsert(payload, on_conflict="scope_type,scope_key"))
+        return
     with connect_db(db_path) as conn:
         conn.execute(
             """
@@ -937,6 +1176,29 @@ def parse_optional_float(value) -> float | None:
 def persist_kalk_bo_values(scope_type: str, scope_key: str, edited_df: pd.DataFrame, db_path: Path = DB_PATH) -> None:
     scope_type = str(scope_type or "").strip()
     scope_key = str(scope_key or "").strip()
+    if supabase_enabled():
+        client = supabase_client()
+        supabase_execute(client.table("kalk_bo_values").delete().eq("scope_type", scope_type).eq("scope_key", scope_key))
+        rows = []
+        for _, row in edited_df.iterrows():
+            mat = str(row.get("MAT", "")).strip()
+            if not mat:
+                continue
+            driver_value = parse_optional_float(row.get("DRIVER"))
+            indicator_value = parse_optional_float(row.get("INDICADOR"))
+            if driver_value is None and indicator_value is None:
+                continue
+            rows.append(
+                {
+                    "scope_type": scope_type,
+                    "scope_key": scope_key,
+                    "mat": mat,
+                    "driver_value": driver_value,
+                    "indicator_value": indicator_value,
+                }
+            )
+        supabase_insert_batches("kalk_bo_values", rows)
+        return
     with connect_db(db_path) as conn:
         conn.execute(
             "DELETE FROM kalk_bo_values WHERE SCOPE_TYPE = ? AND SCOPE_KEY = ?",
@@ -1640,6 +1902,23 @@ def redistribute_collaborator_leaders(
     db_path: str | Path = DB_PATH,
 ) -> tuple[int, list[str]]:
     errors: list[str] = []
+    if supabase_enabled():
+        df = load_collaborators_from_db(db_path)
+        redistributed, updates = redistribute_collaborator_leaders_in_frame(
+            df,
+            setores_df,
+            subsetores_df,
+            only_current_leaders=only_current_leaders,
+        )
+        if updates:
+            client = supabase_client()
+            for _, row in redistributed.iterrows():
+                mat = str(row.get("MAT", "")).strip()
+                if not mat:
+                    continue
+                lider = str(row.get("LIDER", "")).strip()
+                supabase_execute(client.table("colaboradores").update({"lider": lider}).eq("mat", mat))
+        return updates, errors
     with connect_db(db_path) as conn:
         df = pd.read_sql_query(
             """
@@ -1737,6 +2016,65 @@ def persist_crud_changes_to_db(changes: dict, db_path: str | Path = DB_PATH) -> 
     errors: list[str] = []
     wrote_changes = False
     changed_leader_ids: set[str] = set()
+    if supabase_enabled():
+        current_df = load_collaborators_from_db(db_path)
+        existing_area_by_mat = {
+            str(row.get("MAT", "")).strip(): (
+                str(row.get("SETOR", "") or "").strip(),
+                str(row.get("SUBSETOR", "") or "").strip(),
+            )
+            for _, row in current_df.iterrows()
+            if str(row.get("MAT", "")).strip()
+        }
+        existing_ids = set(existing_area_by_mat)
+        client = supabase_client()
+
+        delete_ids = {str(value).strip() for value in changes.get("deletes", []) if str(value).strip()}
+        for mat in delete_ids:
+            supabase_execute(client.table("colaboradores").delete().eq("mat", mat))
+            existing_ids.discard(mat)
+            changed_leader_ids.add(mat)
+            wrote_changes = True
+
+        upsert_rows = []
+        for _, details in (changes.get("upserts", {}) or {}).items():
+            if not isinstance(details, dict):
+                continue
+            row = normalize_collaborator_payload(details)
+            mat = row["MAT"]
+            error = validate_collaborator_row(row, existing_ids | {mat}, allow_existing=True)
+            if error:
+                errors.append(f"{mat or 'sem MAT'}: {error}")
+                continue
+            upsert_rows.append(supabase_text_row(row, COLLABORATOR_COLUMNS, SUPABASE_COLLABORATOR_COLUMNS))
+            previous_area = existing_area_by_mat.get(mat)
+            new_area = (row["SETOR"], row["SUBSETOR"])
+            existing_ids.add(mat)
+            if previous_area and previous_area != new_area:
+                changed_leader_ids.add(mat)
+            wrote_changes = True
+
+        for start in range(0, len(upsert_rows), 500):
+            supabase_execute(
+                client.table("colaboradores").upsert(upsert_rows[start : start + 500], on_conflict="mat")
+            )
+
+        if wrote_changes and changed_leader_ids:
+            try:
+                setores_df, _, subsetores_df = load_hierarchy_from_db(db_path=db_path)
+                _, redistribution_errors = redistribute_collaborator_leaders(
+                    setores_df,
+                    subsetores_df,
+                    only_current_leaders=changed_leader_ids,
+                    db_path=db_path,
+                )
+                errors.extend(redistribution_errors)
+            except Exception as exc:
+                errors.append(f"Alteracao salva, mas redistribuicao de liderados falhou: {exc}")
+            for mat in delete_ids:
+                supabase_execute(client.table("colaboradores").update({"lider": ""}).eq("lider", mat))
+        return errors
+
     with connect_db(db_path) as conn:
         existing_area_by_mat: dict[str, tuple[str, str]] = {}
         for row in conn.execute("SELECT MAT, SETOR, SUBSETOR FROM colaboradores").fetchall():
