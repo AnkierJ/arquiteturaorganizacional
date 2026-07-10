@@ -5733,7 +5733,15 @@ def main():
     )
 
     st.subheader("Tabela")
-    st.dataframe(filtered[["MAT", "NOME", "CARGO", "LIDER", "POSICAO"]], use_container_width=True)
+    table_columns = ["MAT", "NOME", "CARGO", "SUPERSETOR", "SETOR", "SUBSETOR", "LIDER", "POSICAO"]
+    table_df = filtered.copy()
+    for column in table_columns:
+        if column not in table_df.columns:
+            table_df[column] = pd.NA
+    for column in ["SUPERSETOR", "SETOR", "SUBSETOR"]:
+        table_df[column] = table_df[column].replace("", pd.NA)
+
+    st.dataframe(table_df[table_columns], use_container_width=True)
 
     csv = filtered.to_csv(index=False, sep=";").encode("utf-8")
     st.download_button(
